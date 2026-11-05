@@ -1,0 +1,11 @@
+[client]
+showSidebarNavigation = false
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[server]
+headless = true
+fileWatcherType = "auto"
+
+[browser]
+gatherUsageStats = false

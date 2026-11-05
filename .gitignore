@@ -1,0 +1,35 @@
+# 环境与密钥
+.env
+*.local
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 依赖与构建
+dist/
+build/
+
+# 数据库
+*.db
+*.sqlite3
+*.sqlite
+
+# Playwright / 浏览器产物
+playwright-report/
+__blobstorage__/
+__screenshots__/
+
+# 导出临时文件
+data/exports/
+exports/
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,4 +1,4 @@
-"""LLM 客户端封装（OpenAI 兼容接口）。"""
+"""LLM 客户端封装（OpenAI 兼容接口 / Ollama 原生接口）。"""
 
 from __future__ import annotations
 
@@ -6,27 +6,61 @@ import json
 import re
 from typing import Any
 
+import requests
 from openai import OpenAI
 
 from .config import LLMConfig
 
 
 class LLMClient:
-    """封装 OpenAI 兼容的 Chat Completions 接口。"""
+    """封装 LLM 调用。
+
+    - provider=openai：走 OpenAI 兼容的 Chat Completions（DeepSeek 等）。
+    - provider=ollama：走 Ollama 原生 /api/chat，可传 think=false 关闭 Qwen3 思考。
+    """
 
     def __init__(self, config: LLMConfig):
         self.config = config
-        self.client = OpenAI(base_url=config.base_url, api_key=config.api_key)
+        self.provider = config.provider
+        self.client = (
+            OpenAI(base_url=config.base_url, api_key=config.api_key)
+            if self.provider != "ollama"
+            else None
+        )
 
     def chat(self, messages: list[dict[str, Any]], temperature: float | None = None) -> str:
         """发送消息并返回文本内容。"""
+        temp = self.config.temperature if temperature is None else temperature
+        if self.provider == "ollama":
+            return self._chat_ollama(messages, temp)
+
         resp = self.client.chat.completions.create(
             model=self.config.model,
             messages=messages,
-            temperature=self.config.temperature if temperature is None else temperature,
+            temperature=temp,
             max_tokens=self.config.max_tokens,
         )
         return resp.choices[0].message.content or ""
+
+    def _chat_ollama(self, messages: list[dict[str, Any]], temperature: float) -> str:
+        """调用 Ollama 原生 /api/chat，关闭 thinking 以避免占满 max_tokens。"""
+        base = self.config.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": self.config.max_tokens,
+            },
+        }
+        resp = requests.post(f"{base}/api/chat", json=payload, timeout=300)
+        resp.raise_for_status()
+        data = resp.json()
+        return (data.get("message") or {}).get("content", "") or ""
 
     @staticmethod
     def extract_json(text: str) -> Any | None:

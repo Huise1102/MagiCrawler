@@ -1,7 +1,6 @@
 # 环境与密钥
 .env
 *.local
-.streamlit/secrets.toml
 
 # Python
 __pycache__/
@@ -14,6 +13,7 @@ env/
 # 依赖与构建
 dist/
 build/
+node_modules/
 
 # 数据库
 *.db
@@ -24,6 +24,7 @@ build/
 playwright-report/
 __blobstorage__/
 __screenshots__/
+.screenshots/
 
 # 导出临时文件
 data/exports/

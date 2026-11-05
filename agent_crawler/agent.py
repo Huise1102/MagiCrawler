@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .agent_prompt import ACTION_PROTOCOL, build_system_prompt
@@ -17,6 +17,11 @@ from .llm import LLMClient
 from .schema import Field, parse_schema, schema_fields_to_text, validate_items
 
 
+def _elapsed_ms(start: float) -> float:
+    """从 start（perf_counter）到现在的毫秒数。"""
+    return round((time.perf_counter() - start) * 1000, 1)
+
+
 @dataclass
 class RunResult:
     """一次采集的最终结果。"""
@@ -24,6 +29,7 @@ class RunResult:
     items: list[dict]
     note: str = ""
     trajectory: list = None
+    timings: dict = field(default_factory=dict)
 
     def to_payload(self) -> dict:
         return {"items": self.items, "_note": self.note}
@@ -35,6 +41,7 @@ class Agent:
     def __init__(self, llm: LLMClient, config: CrawlerConfig):
         self.llm = llm
         self.config = config
+        self._llm_calls = 0
 
     # ---------------- 主入口 ----------------
 
@@ -50,11 +57,22 @@ class Agent:
             idle_timeout_s=self.config.browser_idle_timeout_s,
         )
         trajectory: list[dict] = []
+        timings: dict[str, Any] = {}
+        self._llm_calls = 0
+        start = time.perf_counter()
         try:
+            t0 = time.perf_counter()
             tools.start()
-            return self._loop(tools, fields, task_desc, start_url, trajectory)
+            timings["browser_ms"] = _elapsed_ms(t0)
+            result = self._loop(tools, fields, task_desc, start_url, trajectory, timings)
         finally:
             tools.close()
+
+        timings["llm_calls"] = self._llm_calls
+        timings["steps"] = len(trajectory)
+        timings["total_ms"] = _elapsed_ms(start)
+        result.timings = timings
+        return result
 
     # ---------------- 决策循环 ----------------
 
@@ -65,6 +83,7 @@ class Agent:
         task_desc: str,
         start_url: str,
         trajectory: list,
+        timings: dict,
     ) -> RunResult:
         schema_fields_text = schema_fields_to_text(fields)
         system_prompt = build_system_prompt(task_desc, start_url, schema_fields_text)
@@ -75,20 +94,24 @@ class Agent:
         last_snapshot = ""
 
         # 起始导航
+        t0 = time.perf_counter()
         snapshot = tools.snapshot(self.config.max_snapshot_chars) if not start_url else tools.navigate(start_url)
+        timings["navigate_ms"] = _elapsed_ms(t0)
         last_snapshot = snapshot
 
         for step in range(self.config.max_steps):
             user_msg = self._build_user_msg(snapshot, collected, trajectory)
+            t_dec = time.perf_counter()
             action = self._decide(system_prompt, user_msg)
             if action is None:
                 # 决策解析失败，重试一次
                 action = self._decide(system_prompt, user_msg + "\n（请严格只输出一个 JSON 动作对象）")
+            dec_ms = _elapsed_ms(t_dec)
+            timings["decision_ms"] = round(timings.get("decision_ms", 0) + dec_ms, 1)
+
             tool = (action or {}).get("tool", "")
             args = (action or {}).get("args", {}) or {}
-
-            step_log = {"step": step + 1, "tool": tool, "args": args, "time": time.strftime("%H:%M:%S")}
-            trajectory.append(step_log)
+            t_exec = time.perf_counter()
 
             # 1) 结束
             if tool == "finish":
@@ -100,12 +123,16 @@ class Agent:
                 note = data.get("_note", "") if isinstance(data, dict) else ""
                 if not note:
                     note = self._build_note(collected, task_desc)
+                self._log_step(trajectory, step, tool, args, dec_ms, 0.0)
                 return RunResult(items=collected, note=note, trajectory=trajectory)
 
             # 2) 提取候选
             if tool == "extract":
                 remain = (target - len(collected)) if target else None
                 candidates = self._extract(tools, fields, remain)
+                exec_ms = _elapsed_ms(t_exec)
+                timings["extract_ms"] = round(timings.get("extract_ms", 0) + exec_ms, 1)
+                self._log_step(trajectory, step, tool, args, dec_ms, exec_ms)
                 before = len(collected)
                 collected = self._merge(collected, candidates)
                 if target:
@@ -123,6 +150,9 @@ class Agent:
 
             # 3) 其它浏览器动作
             snapshot = self._execute(tools, tool, args)
+            exec_ms = _elapsed_ms(t_exec)
+            timings["action_ms"] = round(timings.get("action_ms", 0) + exec_ms, 1)
+            self._log_step(trajectory, step, tool, args, dec_ms, exec_ms)
             if snapshot and snapshot != last_snapshot:
                 no_progress = 0
             else:
@@ -140,12 +170,35 @@ class Agent:
 
     # ---------------- 子步骤 ----------------
 
+    @staticmethod
+    def _log_step(
+        trajectory: list,
+        step: int,
+        tool: str,
+        args: dict,
+        dec_ms: float,
+        exec_ms: float,
+    ) -> None:
+        """记录单步动作与耗时（决策 / 执行 / 合计）。"""
+        trajectory.append(
+            {
+                "step": step + 1,
+                "tool": tool,
+                "args": args,
+                "time": time.strftime("%H:%M:%S"),
+                "llm_ms": dec_ms,
+                "exec_ms": exec_ms,
+                "total_ms": round(dec_ms + exec_ms, 1),
+            }
+        )
+
     def _decide(self, system_prompt: str, user_msg: str) -> dict | None:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg + "\n\n" + ACTION_PROTOCOL},
         ]
         raw = self.llm.chat(messages, temperature=0)
+        self._llm_calls += 1
         data = self.llm.extract_json(raw)
         if isinstance(data, dict):
             return data
@@ -195,6 +248,7 @@ class Agent:
             {"role": "user", "content": prompt},
         ]
         raw = self.llm.chat(messages, temperature=0)
+        self._llm_calls += 1
         data = self.llm.extract_json(raw)
         if isinstance(data, dict) and isinstance(data.get("items"), list):
             return validate_items(data["items"], fields)

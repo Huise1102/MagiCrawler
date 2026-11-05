@@ -114,7 +114,11 @@ def _coerce(value: Any, ftype: str) -> Any:
         return None
     try:
         if ftype == "string":
-            return str(value).strip() or None
+            s = str(value).strip()
+            # 模型有时会把缺失值写成字符串 "null"/"none"/"nil"，统一视为缺失
+            if not s or s.lower() in ("null", "none", "nil"):
+                return None
+            return s
         if ftype == "number":
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 return float(value)

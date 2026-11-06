@@ -28,21 +28,28 @@ class LLMClient:
             else None
         )
 
-    def chat(self, messages: list[dict[str, Any]], temperature: float | None = None) -> str:
-        """发送消息并返回文本内容。"""
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """发送消息并返回文本内容。timeout 为本次调用超时（秒）。"""
         temp = self.config.temperature if temperature is None else temperature
+        timeout_s = min(timeout or self.config.timeout_s, self.config.timeout_s)
         if self.provider == "ollama":
-            return self._chat_ollama(messages, temp)
+            return self._chat_ollama(messages, temp, timeout_s)
 
         resp = self.client.chat.completions.create(
             model=self.config.model,
             messages=messages,
             temperature=temp,
             max_tokens=self.config.max_tokens,
+            timeout=timeout_s,
         )
         return resp.choices[0].message.content or ""
 
-    def _chat_ollama(self, messages: list[dict[str, Any]], temperature: float) -> str:
+    def _chat_ollama(self, messages: list[dict[str, Any]], temperature: float, timeout_s: float) -> str:
         """调用 Ollama 原生 /api/chat，关闭 thinking 以避免占满 max_tokens。"""
         base = self.config.base_url.rstrip("/")
         if base.endswith("/v1"):
@@ -57,7 +64,7 @@ class LLMClient:
                 "num_predict": self.config.max_tokens,
             },
         }
-        resp = requests.post(f"{base}/api/chat", json=payload, timeout=300)
+        resp = requests.post(f"{base}/api/chat", json=payload, timeout=timeout_s)
         resp.raise_for_status()
         data = resp.json()
         return (data.get("message") or {}).get("content", "") or ""

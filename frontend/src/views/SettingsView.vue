@@ -215,46 +215,15 @@ onMounted(async () => {
 
 <template>
   <section class="page settings-page">
-    <header class="page-head row">
-      <div>
-        <h1>设置</h1>
-        <p class="sub">外观即时生效；模型配置保存后立即应用于新的采集任务。</p>
-      </div>
-      <span v-if="current" class="settings-current">
+    <div v-if="current" class="page-toolbar">
+      <span class="settings-current">
         当前模型
         <strong>{{ current.provider === 'ollama' ? '本地 · ' : '云端 · ' }}{{ current.model }}</strong>
       </span>
-    </header>
+    </div>
 
     <div v-if="error" class="alert error">{{ error }}</div>
     <div v-if="notice" class="alert info">{{ notice }}</div>
-
-    <section class="card settings-card">
-      <div class="settings-head">
-        <h2>外观</h2>
-        <p>主题只保存在本机浏览器，切换后立即生效。</p>
-      </div>
-      <div class="theme-options">
-        <button
-          v-for="opt in THEME_OPTIONS"
-          :key="opt.key"
-          type="button"
-          class="theme-option"
-          :class="{ active: themePref === opt.key }"
-          @click="chooseTheme(opt.key)"
-        >
-          <span class="theme-preview" :class="`preview-${opt.key}`">
-            <i /><i /><i />
-          </span>
-          <strong>{{ opt.label }}</strong>
-          <small>{{ opt.desc }}</small>
-          <span v-if="opt.key === themePref" class="theme-check">当前</span>
-        </button>
-      </div>
-      <p class="settings-note">
-        当前实际使用：{{ resolvedTheme === 'dark' ? '深色' : '浅色' }}（<code>{{ themePref }}</code>）
-      </p>
-    </section>
 
     <section v-if="!loading" class="card settings-card">
       <div class="settings-head">
@@ -385,6 +354,33 @@ onMounted(async () => {
 
       <p class="settings-note">
         保存后立即生效；正在运行的任务会继续使用开始时的模型。配置文件：<code>{{ settingsFile || 'data/settings.json' }}</code>
+      </p>
+    </section>
+
+    <section class="card settings-card">
+      <div class="settings-head">
+        <h2>外观</h2>
+        <p>主题只保存在本机浏览器，切换后立即生效。</p>
+      </div>
+      <div class="theme-options">
+        <button
+          v-for="opt in THEME_OPTIONS"
+          :key="opt.key"
+          type="button"
+          class="theme-option"
+          :class="{ active: themePref === opt.key }"
+          @click="chooseTheme(opt.key)"
+        >
+          <span class="theme-preview" :class="`preview-${opt.key}`">
+            <i /><i /><i />
+          </span>
+          <strong>{{ opt.label }}</strong>
+          <small>{{ opt.desc }}</small>
+          <span v-if="opt.key === themePref" class="theme-check">当前</span>
+        </button>
+      </div>
+      <p class="settings-note">
+        当前实际使用：{{ resolvedTheme === 'dark' ? '深色' : '浅色' }}（<code>{{ themePref }}</code>）
       </p>
     </section>
   </section>

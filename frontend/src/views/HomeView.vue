@@ -106,7 +106,7 @@ onBeforeUnmount(stopAuto)
         </div>
       </div>
 
-      <div class="hero-carousel" @mouseenter="stopAuto" @mouseleave="startAuto">
+      <div class="hero-carousel">
         <div class="carousel-head">
           <span class="carousel-kicker">它能做什么</span>
           <div class="carousel-buttons">

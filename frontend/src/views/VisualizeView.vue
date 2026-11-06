@@ -281,11 +281,6 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="page">
-    <header class="page-head">
-      <h1>可视化</h1>
-      <p class="sub">选择一份已采集的数据，由智能体自动设计图表并渲染展示。</p>
-    </header>
-
     <div class="card">
       <div class="grid-2">
         <label class="field">

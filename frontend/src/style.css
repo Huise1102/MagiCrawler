@@ -2978,7 +2978,7 @@ a.btn:hover {
 }
 
 /* 桌面端首页一屏展示：不加纵向滚动，卡片自适应压缩 */
-@media (min-width: 961px) and (min-height: 720px) {
+@media (min-width: 1280px) and (min-height: 720px) {
   .main:has(.intro-page) {
     display: flex;
     align-items: center;
@@ -3024,44 +3024,9 @@ a.btn:hover {
     margin-top: 18px;
   }
 
-  .hero-carousel {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    padding: 16px 20px 12px;
-  }
-
+  /* 轮播保持原有的固定高度，不随页面拉伸 */
   .carousel-stage {
-    flex: 1 1 auto;
-    height: auto;
-    min-height: 0;
-  }
-
-  .hero-slide {
-    justify-content: center;
-    min-height: 0;
-  }
-
-  .hero-slide h2 {
-    margin-top: 8px;
-    font-size: 20.5px;
-  }
-
-  .hero-slide p {
-    font-size: 13px;
-    line-height: 1.65;
-  }
-
-  .slide-points {
-    margin-top: 9px;
-  }
-
-  .slide-visual {
-    flex: 1 1 auto;
-    min-height: 0;
-    max-height: 240px;
-    margin-top: 16px;
-    overflow: hidden;
+    height: 392px;
   }
 
   .intro-features {
@@ -3114,14 +3079,24 @@ a.btn:hover {
 }
 
 /* 中等宽度下特性卡改为两列，避免四列文字被挤成多行 */
-@media (min-width: 961px) and (max-width: 1180px) {
+@media (min-width: 961px) and (max-width: 1279px) {
   .intro-features {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
-/* 视口较矮时隐藏轮播内的示意窗口，保证文字不被挤压 */
-@media (min-width: 961px) and (max-height: 750px) {
+/* 矮视口下压缩轮播并隐藏示意窗口，保证一屏不裁切 */
+@media (min-width: 1280px) and (max-height: 820px) {
+  .carousel-stage {
+    height: 340px;
+  }
+}
+
+@media (min-width: 1280px) and (max-height: 760px) {
+  .carousel-stage {
+    height: 240px;
+  }
+
   .slide-visual {
     display: none;
   }

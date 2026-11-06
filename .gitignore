@@ -20,6 +20,9 @@ node_modules/
 *.sqlite3
 *.sqlite
 
+# 本地模型设置（含 API Key）
+data/settings.json
+
 # Playwright / 浏览器产物
 playwright-report/
 __blobstorage__/

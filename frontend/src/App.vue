@@ -22,6 +22,7 @@ import { RouterLink, RouterView } from 'vue-router'
           <RouterLink to="/" exact-active-class="active">首页</RouterLink>
           <RouterLink to="/schedules" active-class="active">定时任务</RouterLink>
           <RouterLink to="/visualize" active-class="active">可视化</RouterLink>
+          <RouterLink to="/documents" active-class="active">文档库</RouterLink>
           <RouterLink to="/history" active-class="active">历史任务</RouterLink>
         </nav>
       </div>

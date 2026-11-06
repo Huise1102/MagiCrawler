@@ -3047,10 +3047,6 @@ a.btn:hover {
     grid-template-columns: 1fr;
   }
 
-  .intro-cta {
-    padding: 24px 20px;
-  }
-
   .help-shortcuts {
     grid-template-columns: 1fr;
   }
@@ -3204,9 +3200,5 @@ a.btn:hover {
 
 [data-theme='dark'] small {
   color: var(--muted);
-}
-
-[data-theme='dark'] .intro-cta {
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
 }
 

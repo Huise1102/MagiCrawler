@@ -61,11 +61,13 @@ class BrowserTools:
     def _launch_browser(self):
         """启动浏览器：优先使用指定 channel，否则回退到系统 Edge/Chrome。"""
         if self.channel:
-            return self._pw.chromium.launch(headless=self.headless, channel=self.channel)
+            return self._pw.chromium.launch(
+                headless=self.headless, channel=self.channel, timeout=self.timeout_ms
+            )
         last_err: Exception | None = None
         for channel in (None, "msedge", "chrome"):
             try:
-                kwargs: dict[str, Any] = {"headless": self.headless}
+                kwargs: dict[str, Any] = {"headless": self.headless, "timeout": self.timeout_ms}
                 if channel:
                     kwargs["channel"] = channel
                 return self._pw.chromium.launch(**kwargs)

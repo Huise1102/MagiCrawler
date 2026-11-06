@@ -2395,58 +2395,7 @@ a.btn:hover {
   line-height: 1.72;
 }
 
-/* 底部 CTA */
-
-.intro-cta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 24px;
-  margin-top: 30px;
-  padding: 28px 30px;
-  border-radius: 18px;
-  background: linear-gradient(118deg, #1d4ed8, #6d28d9 56%, #0e7490);
-  color: #fff;
-  box-shadow: 0 18px 40px rgba(37, 99, 235, 0.26);
-}
-
-.intro-cta h2 {
-  margin: 0;
-  font-size: 22px;
-}
-
-.intro-cta p {
-  margin: 6px 0 0;
-  color: rgba(255, 255, 255, 0.8);
-  font-size: 14px;
-}
-
-.intro-cta-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.intro-cta .btn.primary {
-  background: #fff;
-  color: #1d4ed8;
-  box-shadow: none;
-}
-
-.intro-cta .btn.primary:hover:not(:disabled) {
-  background: #f1f5ff;
-}
-
-.intro-cta .btn.ghost {
-  border-color: rgba(255, 255, 255, 0.32);
-  background: rgba(255, 255, 255, 0.12);
-  color: #fff;
-}
-
-.intro-cta .btn.ghost:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.2);
-}
+/* 底部 CTA 已移除 */
 
 /* ================================================================
    帮助中心
@@ -2980,7 +2929,7 @@ a.btn:hover {
     max-height: 900px;
     padding-top: 0;
     display: grid;
-    grid-template-rows: minmax(0, 1fr) auto auto;
+    grid-template-rows: minmax(0, 1fr) auto;
     gap: 11px;
   }
 
@@ -3046,21 +2995,6 @@ a.btn:hover {
     grid-column: 2;
     font-size: 12.3px;
     line-height: 1.58;
-  }
-
-  .intro-cta {
-    margin-top: 0;
-    padding: 22px 24px;
-    gap: 16px;
-  }
-
-  .intro-cta h2 {
-    font-size: 19px;
-  }
-
-  .intro-cta p {
-    margin-top: 4px;
-    font-size: 13px;
   }
 }
 

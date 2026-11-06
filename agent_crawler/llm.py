@@ -23,7 +23,7 @@ class LLMClient:
         self.config = config
         self.provider = config.provider
         self.client = (
-            OpenAI(base_url=config.base_url, api_key=config.api_key)
+            OpenAI(base_url=config.base_url, api_key=config.api_key or "EMPTY")
             if self.provider != "ollama"
             else None
         )

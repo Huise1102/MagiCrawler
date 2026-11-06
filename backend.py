@@ -11,22 +11,26 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from openai import OpenAI
 from pydantic import BaseModel
 
 from agent_crawler import (
     Agent,
     DocumentClassifier,
     LLMClient,
+    LLMConfig,
     Schedule,
     Task,
     TASK_STATUS,
@@ -74,12 +78,97 @@ logging.getLogger().addHandler(_memory_handler)
 
 _app_llm_config, _app_crawler_config = load_config()
 
+# 模型设置持久化在 data/settings.json，优先于 .env，保存后即时生效
+_SETTINGS_FILE = Path(_app_crawler_config.db_path).resolve().parent / "settings.json"
+
+
+def _settings_payload(cfg: LLMConfig) -> dict[str, object]:
+    """返回可序列化的模型配置（本地服务，允许前端回显 API Key）。"""
+    return {
+        "provider": cfg.provider,
+        "base_url": cfg.base_url,
+        "api_key": cfg.api_key,
+        "model": cfg.model,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+        "timeout_s": cfg.timeout_s,
+    }
+
+
+def _read_settings_file() -> dict:
+    """读取整个设置文件；不存在或损坏时返回空字典。"""
+    if not _SETTINGS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("读取设置文件失败：%s", exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_settings_file(payload: dict) -> None:
+    """原子写入设置文件，避免半截 JSON。"""
+    _SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _SETTINGS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(_SETTINGS_FILE)
+
+
+def _load_saved_theme() -> str:
+    ui = _read_settings_file().get("ui")
+    theme = ui.get("theme") if isinstance(ui, dict) else None
+    return theme if theme in ("light", "dark", "system") else "system"
+
+
+def _load_saved_llm() -> Optional[LLMConfig]:
+    """读取已保存的模型设置；文件缺失或损坏时回退到 .env。"""
+    data = _read_settings_file()
+    llm = data.get("llm") if isinstance(data, dict) else None
+    if not isinstance(llm, dict):
+        return None
+
+    cfg = LLMConfig()
+    for key in ("provider", "base_url", "api_key", "model"):
+        value = llm.get(key)
+        if isinstance(value, str) and value.strip():
+            setattr(cfg, key, value.strip())
+    for key, cast, low, high in (
+        ("temperature", float, 0.0, 2.0),
+        ("max_tokens", int, 64, 32768),
+        ("timeout_s", int, 10, 600),
+    ):
+        try:
+            value = cast(llm.get(key))
+        except (TypeError, ValueError):
+            continue
+        setattr(cfg, key, max(low, min(high, value)))
+    if cfg.provider not in ("ollama", "openai"):
+        cfg.provider = "ollama"
+    return cfg
+
+
+def _save_settings(cfg: LLMConfig) -> None:
+    """保存模型设置，保留已有外观设置。"""
+    data = _read_settings_file()
+    data["llm"] = _settings_payload(cfg)
+    _write_settings_file(data)
+
+
+_app_llm_config = _load_saved_llm() or _app_llm_config
+_ui_theme = _load_saved_theme()
+
 storage = Storage(_app_crawler_config.db_path)
 llm_client = LLMClient(_app_llm_config)
 
 # 轨迹仅保留在内存中（不落库），供前端查看最近执行过的任务
 _trajectories: dict[str, list] = {}
 _TRAJECTORY_KEEP = 50
+
+# 采集链路事件（逐步追加，供首页实时展示智能体决策链路）
+_chains: dict[str, list] = {}
+_CHAIN_KEEP = 50
+_CHAIN_MAX_STEPS = 80
 
 # 同一时刻只运行一个爬取任务，避免浏览器实例被并发抢占
 _schedule_lock = asyncio.Lock()
@@ -289,6 +378,153 @@ class SchemaBody(BaseModel):
     start_url: str = ""
 
 
+class LLMSettingsBody(BaseModel):
+    provider: str = "ollama"
+    base_url: str
+    api_key: str = ""
+    model: str
+    temperature: float = 0
+    max_tokens: int = 4096
+    timeout_s: int = 120
+
+
+class ThemeBody(BaseModel):
+    theme: str
+
+
+class ModelQueryBody(BaseModel):
+    provider: str = "ollama"
+    base_url: str
+    api_key: str = ""
+
+
+def _normalize_ollama_base(base_url: str) -> str:
+    """Ollama 原生接口根地址：去掉末尾斜杠与 /v1。"""
+    base = base_url.strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base
+
+
+def _build_llm_config(body: LLMSettingsBody) -> LLMConfig:
+    """校验设置请求并构造 LLM 配置。"""
+    provider = (body.provider or "").strip().lower()
+    if provider not in ("ollama", "openai"):
+        raise HTTPException(status_code=400, detail="模型服务仅支持 ollama 或 openai")
+    base_url = (body.base_url or "").strip()
+    model = (body.model or "").strip()
+    if not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="接口地址需以 http:// 或 https:// 开头")
+    if not model:
+        raise HTTPException(status_code=400, detail="请填写模型名称")
+    temperature = float(body.temperature)
+    if not 0 <= temperature <= 2:
+        raise HTTPException(status_code=400, detail="temperature 需在 0-2 之间")
+    max_tokens = int(body.max_tokens)
+    if not 64 <= max_tokens <= 32768:
+        raise HTTPException(status_code=400, detail="max_tokens 需在 64-32768 之间")
+    timeout_s = int(body.timeout_s)
+    if not 10 <= timeout_s <= 600:
+        raise HTTPException(status_code=400, detail="超时时间需在 10-600 秒之间")
+
+    cfg = LLMConfig()
+    cfg.provider = provider
+    cfg.base_url = base_url
+    cfg.api_key = (body.api_key or "").strip()
+    cfg.model = model
+    cfg.temperature = temperature
+    cfg.max_tokens = max_tokens
+    cfg.timeout_s = timeout_s
+    return cfg
+
+
+# ---------------- 设置（外观与模型配置均持久化到 data/settings.json） ----------------
+
+
+@app.get("/api/settings")
+def get_settings():
+    return {
+        "llm": _settings_payload(_app_llm_config),
+        "ui": {"theme": _ui_theme},
+        "settings_file": str(_SETTINGS_FILE),
+    }
+
+
+@app.put("/api/settings")
+def update_settings(body: LLMSettingsBody):
+    """保存模型设置并即时切换到新的模型服务。"""
+    global llm_client, _app_llm_config
+    cfg = _build_llm_config(body)
+    _save_settings(cfg)
+    _app_llm_config = cfg
+    llm_client = LLMClient(cfg)
+    logger.info("模型设置已更新：provider=%s model=%s", cfg.provider, cfg.model)
+    return {"status": "saved", "llm": _settings_payload(cfg)}
+
+
+@app.put("/api/settings/theme")
+def update_theme(body: ThemeBody):
+    """保存外观主题，供不同浏览器/设备共享同一偏好。"""
+    global _ui_theme
+    theme = (body.theme or "").strip().lower()
+    if theme not in ("light", "dark", "system"):
+        raise HTTPException(status_code=400, detail="主题仅支持 light / dark / system")
+    _ui_theme = theme
+    data = _read_settings_file()
+    data["ui"] = {"theme": theme}
+    _write_settings_file(data)
+    return {"status": "saved", "theme": theme}
+
+
+@app.post("/api/settings/models")
+def list_models(body: ModelQueryBody):
+    """读取 Ollama 本地模型列表或 OpenAI 兼容服务的模型列表。"""
+    provider = (body.provider or "").strip().lower()
+    base_url = (body.base_url or "").strip()
+    if provider not in ("ollama", "openai"):
+        raise HTTPException(status_code=400, detail="模型服务仅支持 ollama 或 openai")
+    if not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="接口地址需以 http:// 或 https:// 开头")
+    try:
+        if provider == "ollama":
+            resp = requests.get(f"{_normalize_ollama_base(base_url)}/api/tags", timeout=10)
+            resp.raise_for_status()
+            models = [
+                str(m.get("name"))
+                for m in resp.json().get("models", [])
+                if isinstance(m, dict) and m.get("name")
+            ]
+        else:
+            client = OpenAI(base_url=base_url, api_key=body.api_key or "EMPTY", timeout=10)
+            models = [m.id for m in client.models.list().data]
+    except Exception as exc:  # noqa: BLE001 - 统一转成可读错误
+        raise HTTPException(status_code=400, detail=f"获取模型列表失败：{exc}") from exc
+    return {"provider": provider, "models": sorted(set(models))}
+
+
+@app.post("/api/settings/test")
+def test_settings(body: LLMSettingsBody):
+    """用一次极短的对话验证接口地址、密钥与模型是否可用。"""
+    cfg = _build_llm_config(body)
+    cfg.max_tokens = min(cfg.max_tokens, 128)
+    started = time.perf_counter()
+    try:
+        reply = LLMClient(cfg).chat(
+            [{"role": "user", "content": "只回复 OK 两个字母"}],
+            temperature=0,
+            timeout=min(20, cfg.timeout_s),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"连接失败：{exc}") from exc
+    return {
+        "ok": True,
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "reply": (reply or "").strip()[:120],
+        "provider": cfg.provider,
+        "model": cfg.model,
+    }
+
+
 # ---------------- 字段 Schema 生成 ----------------
 
 
@@ -389,8 +625,17 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
     task.status = TASK_STATUS["RUNNING"]
     storage.save(task)
     logger.info("任务开始 %s：%s（%s）", task_id[:8], task_desc, start_url)
+
+    chain: list = []
+    _chains[task_id] = chain
+
+    def _on_step(entry: dict) -> None:
+        """爬虫每完成一步就追加到链路（线程内调用，列表 append 足够安全）。"""
+        if len(chain) < _CHAIN_MAX_STEPS:
+            chain.append(entry)
+
     try:
-        agent = Agent(llm_client, _app_crawler_config)
+        agent = Agent(llm_client, _app_crawler_config, on_step=_on_step)
         result = await asyncio.to_thread(agent.run, task_desc, start_url, schema_json)
 
         task.result_json = json.dumps(result.items, ensure_ascii=False)
@@ -398,6 +643,26 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
         task.trajectory = result.trajectory
         task.timings_json = json.dumps(result.timings or {}, ensure_ascii=False)
         task.status = _status_from(result)
+        if not result.items:
+            task.error = (
+                "未采集到任何数据：页面可能是空壳、需要登录或触发风控，"
+                "请检查起始网址，或在浏览器中登录后重试。"
+            )
+
+        # 补一个收尾节点，让链路末端有明确终点（提前达标时爬虫不会记 finish）
+        if chain and not any(x.get("tool") == "finish" for x in chain):
+            chain.append(
+                {
+                    "step": len(chain),
+                    "tool": "finish",
+                    "args": {},
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "llm_ms": 0.0,
+                    "exec_ms": 0.0,
+                    "total_ms": 0.0,
+                    "items": len(result.items),
+                }
+            )
 
         logger.info(
             "任务结束 %s：%s，采集 %d 条%s",
@@ -410,6 +675,8 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
         _trajectories[task_id] = result.trajectory or []
         while len(_trajectories) > _TRAJECTORY_KEEP:
             _trajectories.pop(next(iter(_trajectories)))
+        while len(_chains) > _CHAIN_KEEP:
+            _chains.pop(next(iter(_chains)))
     except Exception as e:  # noqa: BLE001
         task.status = TASK_STATUS["FAILED"]
         task.error = str(e)
@@ -423,7 +690,7 @@ def _status_from(result) -> str:
     if "超时" in note:
         return TASK_STATUS["PARTIAL"] if n else TASK_STATUS["FAILED"]
     if n == 0:
-        return TASK_STATUS["PARTIAL"]
+        return TASK_STATUS["FAILED"]
     if "少于" in note:
         return TASK_STATUS["PARTIAL"]
     return TASK_STATUS["SUCCESS"]
@@ -468,6 +735,7 @@ def get_task(task_id: str):
         raise HTTPException(status_code=404, detail="任务不存在")
     row = task.to_row()
     row["trajectory"] = _trajectories.get(task_id, [])
+    row["chain"] = _chains.get(task_id, [])
     return row
 
 
@@ -499,6 +767,7 @@ def delete_task(task_id: str):
     storage.delete(task_id)
     storage.detach_task_documents(task_id)
     _trajectories.pop(task_id, None)
+    _chains.pop(task_id, None)
     logger.info("删除任务 %s：%s", task_id[:8], task.task_desc)
     return {"status": "deleted"}
 
@@ -616,18 +885,97 @@ def _sync_documents() -> None:
         storage.mark_task_synced(task.id)
 
 
-# ---------------- 分类与文档 CRUD ----------------
+# ---------------- 子库与文档 CRUD ----------------
 
 
-class CategoryBody(BaseModel):
+class LibraryBody(BaseModel):
     name: str
+
+
+class MoveLibraryBody(BaseModel):
+    library_id: str = ""
 
 
 class DocumentBody(BaseModel):
     title: str = ""
-    category_id: str = ""
+    library_id: str = ""
     fields_json: str = "{}"
     source_url: str = ""
+
+
+def _library_name(body: LibraryBody) -> str:
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="子库名称不能为空")
+    if len(name) > 30:
+        raise HTTPException(status_code=400, detail="子库名称不能超过 30 个字符")
+    return name
+
+
+def _ensure_library(library_id: str) -> str:
+    library_id = (library_id or "").strip()
+    if library_id and not any(
+        lib["id"] == library_id for lib in storage.list_libraries()
+    ):
+        raise HTTPException(status_code=400, detail="子库不存在")
+    return library_id
+
+
+@app.get("/api/libraries")
+def list_libraries():
+    return {"items": storage.list_libraries()}
+
+
+@app.post("/api/libraries")
+def create_library(body: LibraryBody):
+    name = _library_name(body)
+    if any(lib["name"] == name for lib in storage.list_libraries()):
+        raise HTTPException(status_code=400, detail="子库名称已存在")
+    return storage.create_library(name)
+
+
+@app.put("/api/libraries/{library_id}")
+def update_library(library_id: str, body: LibraryBody):
+    name = _library_name(body)
+    if any(
+        lib["name"] == name and lib["id"] != library_id
+        for lib in storage.list_libraries()
+    ):
+        raise HTTPException(status_code=400, detail="子库名称已存在")
+    if not storage.update_library(library_id, name):
+        raise HTTPException(status_code=404, detail="子库不存在")
+    return {"status": "updated"}
+
+
+@app.delete("/api/libraries/{library_id}")
+def delete_library(library_id: str):
+    if library_id == "":
+        raise HTTPException(status_code=400, detail="默认库不能删除")
+    if not storage.delete_library(library_id):
+        raise HTTPException(status_code=404, detail="子库不存在")
+    return {"status": "deleted"}
+
+
+@app.put("/api/tasks/{task_id}/library")
+def move_task_library(task_id: str, body: MoveLibraryBody):
+    """把一次采集批次移入指定子库。"""
+    if not storage.get(task_id):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    library_id = _ensure_library(body.library_id)
+    _sync_documents()
+    updated = storage.set_task_library(task_id, library_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="该采集没有可归档的文档")
+    return {"status": "updated", "updated": updated}
+
+
+@app.delete("/api/document-batches/{task_id}")
+def delete_document_batch(task_id: str):
+    """删除一次采集批次的所有文档。"""
+    updated = storage.delete_task_documents(task_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="该采集没有可删除的文档")
+    return {"status": "deleted", "deleted": updated}
 
 
 class AutoClassifyBody(BaseModel):
@@ -637,9 +985,7 @@ class AutoClassifyBody(BaseModel):
 def _clean_document(body: DocumentBody) -> dict:
     """校验并规范化文档输入。"""
     title = body.title.strip()
-    category_id = body.category_id.strip()
-    if category_id and not any(c["id"] == category_id for c in storage.list_categories()):
-        raise HTTPException(status_code=400, detail="分类不存在")
+    library_id = _ensure_library(body.library_id)
     try:
         fields = json.loads(body.fields_json or "{}")
     except json.JSONDecodeError as e:
@@ -648,10 +994,14 @@ def _clean_document(body: DocumentBody) -> dict:
         raise HTTPException(status_code=400, detail="字段内容必须是 JSON 对象")
     return {
         "title": title or _derive_title(fields),
-        "category_id": category_id,
+        "library_id": library_id,
         "fields_json": json.dumps(fields, ensure_ascii=False, indent=2),
         "source_url": body.source_url.strip(),
     }
+
+
+class CategoryBody(BaseModel):
+    name: str
 
 
 def _category_name(body: CategoryBody) -> str:

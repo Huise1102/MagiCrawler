@@ -311,18 +311,14 @@ onMounted(load)
 
 <template>
   <section class="page">
-    <header class="page-head row">
-      <div>
-        <h1>文档库</h1>
-        <p class="sub">按单次采集归档，可新建子库存放不同采集结果。</p>
-      </div>
+    <div class="page-toolbar">
       <div class="doc-actions">
         <input v-model="query" class="doc-search" placeholder="搜索标题、字段或任务描述" />
         <button type="button" class="btn ghost" @click="openLibraryManager">子库管理</button>
         <button type="button" class="btn ghost" @click="openCreate">新建文档</button>
         <button type="button" class="btn ghost" :disabled="loading" @click="load">刷新</button>
       </div>
-    </header>
+    </div>
 
     <div v-if="error" class="alert error">{{ error }}</div>
 

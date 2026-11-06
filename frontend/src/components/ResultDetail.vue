@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 import { exportUrl } from '../api'
 import ResultTable from './ResultTable.vue'
 import StatusBadge from './StatusBadge.vue'
@@ -9,7 +9,6 @@ const props = defineProps({
 })
 
 const FORMATS = { json: 'JSON', csv: 'CSV', xlsx: 'Excel', md: 'Markdown', docx: 'Word' }
-const showTrajectory = ref(false)
 
 const running = computed(() => ['pending', 'running'].includes(props.task.status))
 const trajectory = computed(() => props.task.trajectory || [])
@@ -36,19 +35,28 @@ const timings = computed(() => {
   }
 })
 const hasTimings = computed(() => Object.keys(timings.value).length > 0)
+const schemaText = computed(() => (props.task.schema_json || '').trim())
+const createdText = computed(() => (props.task.created_at || '').replace('T', ' '))
+
+/** 任务介绍：解析 Schema 字段名与说明，便于回看这条任务要采什么。 */
+const schemaFields = computed(() => {
+  if (!schemaText.value) return []
+  try {
+    const parsed = JSON.parse(schemaText.value)
+    const propsObj = parsed.properties || (parsed.items && parsed.items.properties) || {}
+    return Object.entries(propsObj).map(([name, spec]) => ({
+      name,
+      desc: (spec && typeof spec === 'object' && spec.description) || '',
+    }))
+  } catch {
+    return []
+  }
+})
 
 function formatMs(value) {
   const n = Number(value)
   if (!Number.isFinite(n) || n <= 0) return '—'
   return n >= 1000 ? `${(n / 1000).toFixed(2)} 秒` : `${Math.round(n)} 毫秒`
-}
-
-function formatArgs(args) {
-  try {
-    return JSON.stringify(args || {})
-  } catch {
-    return ''
-  }
 }
 </script>
 
@@ -57,9 +65,48 @@ function formatArgs(args) {
     <div class="result-head">
       <div class="result-title">
         <h2>采集结果</h2>
-        <p class="sub">{{ task.task_desc }}</p>
       </div>
       <StatusBadge :status="task.status" />
+    </div>
+
+    <div class="result-body">
+      <div class="task-intro">
+      <h3>采集任务介绍</h3>
+      <div class="intro-row">
+        <span class="intro-label">目标描述</span>
+        <p class="intro-value">{{ task.task_desc || '—' }}</p>
+      </div>
+      <div class="intro-row">
+        <span class="intro-label">起始网址</span>
+        <p class="intro-value">
+          <a v-if="task.start_url" :href="task.start_url" target="_blank" rel="noopener">
+            {{ task.start_url }}
+          </a>
+          <span v-else>—</span>
+        </p>
+      </div>
+      <div class="intro-row">
+        <span class="intro-label">采集字段</span>
+        <div class="field-chips">
+          <span
+            v-for="f in schemaFields"
+            :key="f.name"
+            class="field-chip"
+            :title="f.desc || f.name"
+          >
+            {{ f.name }}
+          </span>
+          <span v-if="!schemaFields.length" class="intro-value">—</span>
+        </div>
+      </div>
+      <div class="intro-row">
+        <span class="intro-label">创建时间</span>
+        <p class="intro-value mono">{{ createdText || '—' }}</p>
+      </div>
+      <details v-if="schemaText" class="schema-detail">
+        <summary>查看字段 Schema</summary>
+        <pre>{{ schemaText }}</pre>
+      </details>
     </div>
 
     <div class="metrics">
@@ -95,25 +142,6 @@ function formatArgs(args) {
       <span v-if="timings.steps" class="chip">{{ timings.steps }} 步</span>
     </div>
 
-    <p v-if="task.start_url" class="source">
-      来源：<a :href="task.start_url" target="_blank" rel="noopener">{{ task.start_url }}</a>
-    </p>
-
-    <div v-if="trajectory.length" class="trajectory-block">
-      <button type="button" class="btn ghost small" @click="showTrajectory = !showTrajectory">
-        {{ showTrajectory ? '收起轨迹' : `查看轨迹（${trajectory.length} 步）` }}
-      </button>
-      <ol v-if="showTrajectory" class="trajectory">
-        <li v-for="t in trajectory" :key="t.step">
-          <span class="step">第 {{ t.step }} 步</span>
-          <code>{{ t.tool }}</code>
-          <span class="args">{{ formatArgs(t.args) }}</span>
-          <span v-if="t.total_ms" class="ms">{{ t.total_ms }}ms</span>
-          <span class="time">{{ t.time }}</span>
-        </li>
-      </ol>
-    </div>
-
     <ResultTable v-if="items.length" :items="items" />
     <p v-else-if="!running" class="empty">未采集到任何数据。</p>
 
@@ -122,6 +150,7 @@ function formatArgs(args) {
       <a v-for="(label, fmt) in FORMATS" :key="fmt" class="btn ghost small" :href="exportUrl(task.id, fmt)">
         {{ label }}
       </a>
+    </div>
     </div>
   </div>
 </template>

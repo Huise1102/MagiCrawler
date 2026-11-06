@@ -179,29 +179,14 @@ code,
   min-height: 0;
 }
 
-.page-head {
-  margin-bottom: 22px;
-}
-
-.page-head.row {
+/* 页面顶部工具栏：不显示标题，只保留筛选/操作控件 */
+.page-toolbar {
   display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 16px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
   flex-wrap: wrap;
-}
-
-.page-head h1 {
-  margin: 0;
-  font-size: 26px;
-  line-height: 1.3;
-  letter-spacing: 0.2px;
-}
-
-.page-head .sub {
-  margin: 6px 0 0;
-  color: var(--muted);
-  font-size: 14.5px;
+  margin-bottom: 16px;
 }
 
 .card {
@@ -2688,16 +2673,17 @@ a.btn:hover {
 .theme-options {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
-  margin-top: 18px;
+  gap: 12px;
+  margin-top: 14px;
 }
 
 .theme-option {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 14px;
+  align-items: stretch;
+  gap: 2px;
+  padding: 11px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface-muted);
@@ -2722,18 +2708,18 @@ a.btn:hover {
 .theme-preview {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  height: 54px;
-  margin-bottom: 7px;
-  padding: 9px;
+  gap: 3px;
+  height: 34px;
+  margin-bottom: 5px;
+  padding: 7px;
   border: 1px solid var(--border);
   border-radius: 9px;
 }
 
 .theme-preview i {
   display: block;
-  height: 7px;
-  border-radius: 4px;
+  height: 5px;
+  border-radius: 3px;
 }
 
 .theme-preview i:nth-child(1) {
@@ -2983,7 +2969,7 @@ a.btn:hover {
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 20px 24px 18px;
+    padding: 16px 24px 14px;
     height: calc(100vh - 62px);
     overflow: hidden;
   }
@@ -2995,7 +2981,7 @@ a.btn:hover {
     padding-top: 0;
     display: grid;
     grid-template-rows: minmax(0, 1fr) auto auto;
-    gap: 16px;
+    gap: 11px;
   }
 
   .hero {
@@ -3039,7 +3025,7 @@ a.btn:hover {
     grid-template-columns: auto minmax(0, 1fr);
     align-items: start;
     column-gap: 12px;
-    padding: 15px 17px;
+    padding: 20px 18px;
   }
 
   .feature-icon {
@@ -3064,7 +3050,7 @@ a.btn:hover {
 
   .intro-cta {
     margin-top: 0;
-    padding: 17px 24px;
+    padding: 22px 24px;
     gap: 16px;
   }
 
@@ -3282,7 +3268,6 @@ a.btn:hover {
   background: #2563eb;
 }
 
-[data-theme='dark'] .page-head .sub,
 [data-theme='dark'] small {
   color: var(--muted);
 }

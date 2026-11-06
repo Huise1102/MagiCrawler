@@ -2929,7 +2929,7 @@ a.btn:hover {
     max-height: 900px;
     padding-top: 0;
     display: grid;
-    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 0.24fr);
     gap: 11px;
   }
 

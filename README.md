@@ -1,130 +1,205 @@
-# 智能体爬虫
+# MagiCrawler · 智能体爬虫
 
-基于 LLM 智能体 + Playwright 的网页数据采集系统。用户只需输入目标描述、起始网址与字段 Schema，智能体即可自主完成「观察网页 → 决策动作 → 提取数据 → 校验 → 输出」，并支持 JSON / CSV / Excel / Markdown / Word 多格式导出。支持定时爬取（固定间隔 / 每日定点 + 启停开关）、智能可视化（由智能体设计图表）以及全流程耗时统计。内置失败保护：单个任务超过 `MAX_RUN_SECONDS`（默认 600 秒）自动终止，LLM 连续失败自动收尾，服务重启后自动把遗留的“运行中”任务标记为失败。
+输入一句目标描述、一个起始网址和想要的字段，剩下的交给智能体：它会在浏览器里自己观察页面、决定下一步、翻页点击、按 Schema 提取数据，最终输出结构化结果，并支持一键导出。
 
-界面包含 9 个页面：首页（项目介绍 + 轮播）、智能采集、定时任务、可视化、文档库（按采集批次分组 + 自建子库）、历史任务、系统日志、帮助（常见问题）、设置。设置页可切换浅色 / 深色 / 跟随系统主题，并可视化配置模型（本地 Ollama 或任意 OpenAI 兼容接口，只需填 Base URL 与 API Key）。
+项目由 FastAPI + SQLite 后端与 Vue 3 前端组成，覆盖从「采集 → 校验 → 归档 → 定时 → 可视化」的完整链路。
 
-## 技术栈
+## 核心特性
 
-- 前端：Vue 3 + Vite（vue-router）
-- 后端：FastAPI
-- 核心引擎：`agent_crawler`（纯 Python 包，前后端复用）
-- 智能体：LLM（OpenAI 兼容接口，可接 DeepSeek / 千问 / Kimi / 智谱 GLM / Ollama 本地模型）+ ReAct 决策循环
-- 浏览器：Playwright（Chromium）
-- 校验：Pydantic v2 风格的动态 Schema 校验
-- 存储：SQLite（任务、定时任务、文档库与子库）
-- 主题：CSS 变量 + `data-theme`，支持浅色 / 深色 / 跟随系统
+- **自然语言定义任务**：只需描述目标（如「采集这 5 个视频的标题、作者、点赞数」）、起始网址和字段 Schema，无需编写选择器或爬虫脚本。
+- **ReAct 决策链路可视化**：每一步「观察 → 决策 → 动作」实时推送到页面，可看到智能体在做什么、为什么这样做。
+- **结构化输出与校验**：按字段 Schema 校验结果，缺失字段置为 `null` 并附 `_note`，不编造数据。
+- **多格式导出**：JSON / CSV / Excel / Markdown / Word。
+- **定时采集**：支持固定间隔与每日定点，随时启停、立即运行，错过的时间点不补跑。
+- **智能可视化**：由模型设计图表方案（趋势、分布、对比），前端用 ECharts 渲染。
+- **文档库**：按「单次采集批次」自动分组，可自建子库并整批移动、重命名、删除。
+- **历史任务**：保留目标描述、起始网址与字段，可一键重复采集。
+- **设置中心**：浅色 / 深色 / 跟随系统主题；模型可视化配置（本地 Ollama 或任意 OpenAI 兼容接口），保存即刻生效。
+- **稳定性保护**：单任务超时终止、LLM 连续失败自动收尾、服务重启后自动重置遗留「运行中」任务。
 
-## 功能页面
+## 页面一览
 
 | 页面 | 路径 | 说明 |
 | --- | --- | --- |
-| 首页 | `/` | 项目介绍与能力轮播，引导进入采集 |
-| 智能采集 | `/crawl` | 描述目标 + 起始网址 + 字段 Schema，实时展示智能体决策链路 |
-| 定时任务 | `/schedules` | 固定间隔 / 每日定点，支持启停与立即运行 |
-| 可视化 | `/visualize` | 由智能体生成图表方案并渲染 |
-| 文档库 | `/documents` | 按单次采集批次分组，可自建子库并整批移动 |
-| 历史任务 | `/history` | 任务详情、结果查看与重复采集 |
-| 系统日志 | `/logs` | 运行期日志按级别筛选 |
-| 帮助 | `/help` | 常见问题（登录墙、部分完成、字段缺失、模型失败等） |
-| 设置 | `/settings` | 外观主题与模型配置 |
+| 首页 | `/` | 项目介绍与能力轮播 |
+| 智能采集 | `/crawl` | 描述目标 + 起始网址 + 字段 Schema，实时查看决策链路与结果 |
+| 定时任务 | `/schedules` | 固定间隔 / 每日定点，启停与立即运行 |
+| 可视化 | `/visualize` | 智能体生成图表方案并渲染 |
+| 文档库 | `/documents` | 按采集批次分组，自建子库、整批迁移 |
+| 历史任务 | `/history` | 任务详情、耗时明细、重复采集 |
+| 系统日志 | `/logs` | 运行期日志按级别筛选（内存环形缓冲） |
+| 帮助 | `/help` | 常见问题与排查建议 |
+| 设置 | `/settings` | 主题与模型配置 |
 
+## 工作原理
 
-## 安装
+```text
+目标描述 / 起始网址 / 字段 Schema
+              │
+              ▼
+      ┌───────────────┐   observe   ┌──────────────┐
+      │  Playwright    │ ◀────────── │  ReAct 智能体 │
+      └───────────────┘   navigate  └──────────────┘
+              │  click / scroll / extract / finish
+              ▼
+       Schema 校验 → 任务结果入库 → 文档库批次归档 → 导出 / 可视化
+```
+
+智能体只允许调用以下 6 个工具，既保证可控，也避免「自由发挥」：
+
+| 工具 | 作用 |
+| --- | --- |
+| `navigate(url)` | 跳转页面，返回状态码与可读文本 |
+| `fetch()` | 获取当前页可读文本或精简 HTML（去脚本/样式/噪声） |
+| `click(selector)` | 点击翻页、展开详情、切换分类 |
+| `scroll()` | 向下滚动触发懒加载 |
+| `extract(schema)` | 按目标字段提取候选数据 |
+| `finish(data)` | 提交最终结果并结束任务 |
+
+结束条件：已收集到目标数量、翻完所有相关页面，或连续两次工具调用没有新数据。
+
+## 快速开始
+
+环境要求：Python 3.10+、Node.js 18+（仅前端开发或重新构建时需要）。
 
 ```bash
+git clone https://github.com/Huise1102/MagiCrawler.git
+cd MagiCrawler
+
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS / Linux
+
 pip install -r requirements.txt
-playwright install chromium
+playwright install chromium     # 也可设置 BROWSER_CHANNEL=msedge/chrome 复用系统浏览器
+
+copy .env.example .env          # Windows：copy；macOS/Linux：cp，然后填入模型配置
+
+cd frontend
+npm install
+npm run build                   # 产物 frontend/dist 由后端托管（dist 不入库，重新克隆后需构建）
+cd ..
+
+uvicorn backend:app --host 127.0.0.1 --port 8000
 ```
 
-## 配置
+打开 http://127.0.0.1:8000/ 即可使用，接口文档在 http://127.0.0.1:8000/docs。
 
-复制 `.env.example` 为 `.env`，填入 LLM 配置：
-
-```bash
-cp .env.example .env
-```
-
-关键项：
-
-```ini
-LLM_BASE_URL=https://api.deepseek.com
-LLM_API_KEY=sk-你的密钥
-LLM_MODEL=deepseek-chat
-```
-
-使用本地千问（Ollama）时：
-
-```ini
-LLM_PROVIDER=ollama
-LLM_BASE_URL=http://127.0.0.1:11434/v1
-LLM_API_KEY=ollama
-LLM_MODEL=qwen3-8b-16k
-```
-
-也可以不改 `.env`，直接在页面「设置 → 模型」里配置：选择「本地 Ollama」或「OpenAI 兼容接口」，用预设快速填入 OpenAI / DeepSeek / 通义千问 / Kimi / 智谱 GLM，或自定义 Base URL；只需填地址、API Key 与模型名，可点「读取模型」拉取本地模型列表、「测试连接」验证，再「保存并启用」，保存后立即生效，无需重启。
-
-页面保存的配置写入 `data/settings.json`，优先级高于 `.env`；该文件含 API Key，已被 `.gitignore` 排除，请勿提交。该文件缺失或损坏时才回退到 `.env`。主题偏好（`ui.theme`）也保存在这里。
-
-## 启动
-
-### 1. 构建前端（首次或前端代码变更后）
+### 前端开发模式
 
 ```bash
 cd frontend
 npm install
-npm run build
+npm run dev      # http://127.0.0.1:5170，/api 与 /health 已代理到 8000
+npm run build    # 产物输出到 frontend/dist，由后端自动托管
 ```
 
-### 2. 启动服务（单进程，推荐）
+## 模型配置
+
+两种方式，任选其一：
+
+1. **页面配置（推荐）**：进入「设置 → 模型」，选择「本地 Ollama」或「OpenAI 兼容接口」，可用预设一键填入，填写 Base URL、API Key 与模型名；支持「读取模型」拉取本地模型列表、「测试连接」验证，点「保存并启用」即时生效，无需重启。
+2. **`.env`**：按 `.env.example` 填写，重启后端生效。
+
+| 服务 | Base URL | 示例模型 |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| DeepSeek | `https://api.deepseek.com` | `deepseek-chat` |
+| 通义千问（DashScope） | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
+| 本地 Ollama | `http://127.0.0.1:11434/v1` | `qwen3:8b` |
+
+页面保存的配置写入 `data/settings.json`，优先级高于 `.env`；该文件包含 API Key，已被 `.gitignore` 排除。文件缺失或损坏时才回退到 `.env`。主题偏好（`ui.theme`）也存在这里。
+
+本地 Ollama 示例：
 
 ```bash
-uvicorn backend:app --host 127.0.0.1 --port 8000
+ollama pull qwen3:8b
+# 设置页选择「本地 Ollama」，Base URL 保持 http://127.0.0.1:11434/v1，模型填 qwen3:8b
 ```
 
-访问 `http://127.0.0.1:8000/` 使用页面（顶部菜单含首页 / 智能采集 / 定时任务 / 可视化 / 文档库 / 历史任务 / 系统日志 / 帮助 / 设置），
-`http://127.0.0.1:8000/docs` 查看接口文档。
+## 主要配置项
 
-定时任务由后端后台循环驱动（每 10 秒检查一次），服务停止期间错过的时间点会直接跳过，不会补跑。
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `MAX_STEPS` | `30` | 单任务最大决策步数 |
+| `MAX_RUN_SECONDS` | `600` | 单任务最长运行时间，超时终止 |
+| `MAX_RETRIES` | `2` | 单次工具失败重试次数 |
+| `TIMEOUT_MS` | `30000` | 页面操作超时（毫秒） |
+| `MAX_SNAPSHOT_CHARS` | `8000` | 每次喂给模型的页面文本上限 |
+| `HEADLESS` | `true` | 是否无头运行浏览器 |
+| `BROWSER_CHANNEL` | 空 | `msedge` / `chrome` 复用系统浏览器；留空回退 Playwright Chromium |
+| `BLOCK_RESOURCES` | `image,media,font,stylesheet` | 拦截无关资源，加快导航 |
+| `BROWSER_REUSE` | `true` | 跨任务复用同一浏览器，省去启动开销 |
+| `BROWSER_IDLE_TIMEOUT` | `300` | 浏览器空闲回收时间（秒） |
+| `DB_PATH` | `data/crawler.db` | SQLite 数据库路径 |
 
-### 开发模式（前端热更新）
+## 数据存储
 
-```bash
-uvicorn backend:app --reload          # 终端 1
-cd frontend && npm run dev            # 终端 2，访问 http://127.0.0.1:5170
+- `data/crawler.db`：任务、定时任务、文档库与子库、文档记录。
+- `data/settings.json`：模型配置与主题偏好（含 API Key，勿提交）。
+- `data/` 整个目录已在 `.gitignore` 中排除。
+
+文档库按 `task_id` 分批：每次采集的所有条目归为一个批次，批次可整体移入自建子库；删除批次有同步记录，重新打开文档库也不会「复活」。
+
+## 项目结构
+
+```text
+backend.py            # FastAPI 后端入口：任务 / 定时 / 文档库 / 日志 / 设置接口 + 前端静态托管
+frontend/
+  index.html          # 首屏前恢复主题，避免刷新闪白
+  src/
+    views/            # 9 个页面组件
+    api.js            # 后端接口封装
+    router.js         # 路由与页面标题
+    theme.js          # 主题偏好（localStorage + 服务端同步）
+    style.css         # 全局样式与浅色 / 深色变量
+agent_crawler/        # 核心引擎（纯 Python 包）
+  config.py           # 配置加载
+  llm.py              # LLM 客户端（Ollama 原生接口 / OpenAI 兼容接口）
+  agent_prompt.py     # 智能体 System Prompt
+  browser.py          # Playwright 工具封装
+  agent.py            # ReAct 决策循环 + 各阶段耗时埋点
+  visualizer.py       # 图表方案生成
+  classifier.py       # 文档归类
+  schema.py           # 动态 Schema 校验
+  storage.py          # SQLite 持久化
+  exporter.py         # 多格式导出
+  models.py           # 任务 / 定时任务数据模型
+data/                 # 运行时数据（已 gitignore）
+tests/                # 单元测试
 ```
 
-Vite 已配置将 `/api`、`/health` 代理到后端。
+## 接口概览
+
+| 分组 | 路径 |
+| --- | --- |
+| 任务 | `POST /api/tasks`、`GET /api/tasks`、`GET /api/tasks/{id}`、`POST /api/tasks/{id}/cancel`、`DELETE /api/tasks/{id}` |
+| Schema | `POST /api/schema/generate` |
+| 导出 | `GET /api/tasks/{id}/export?fmt=json`（支持 `csv` / `xlsx` / `md` / `docx`） |
+| 可视化 | `POST /api/tasks/{id}/visualize` |
+| 定时任务 | `GET / POST /api/schedules`、`PUT / DELETE /api/schedules/{id}`、`POST /api/schedules/{id}/toggle`、`POST /api/schedules/{id}/run` |
+| 文档库 | `GET /api/documents`、`GET / POST /api/libraries`、`PUT / DELETE /api/libraries/{id}`、`PUT /api/tasks/{id}/library`、`DELETE /api/document-batches/{id}` |
+| 日志 | `GET /api/logs`、`DELETE /api/logs` |
+| 设置 | `GET / PUT /api/settings`、`PUT /api/settings/theme`、`POST /api/settings/models`、`POST /api/settings/test` |
+| 健康检查 | `GET /health` |
+
+## 常见问题
+
+- **为什么任务显示「部分完成」？** 常见原因是页面需要登录（如抖音未登录时主页只剩空壳），智能体拿不到真实数据；也可能是字段只出现在详情页，需要点击后才能取到。系统不会绕过登录或验证码，如遇此类目标请改用公开页面，或自行扩展「复用已登录浏览器会话」的能力。
+- **为什么结果条目数比要求的多？** 若目标里写「5 个视频」，建议同时给出明确的筛选条件或示例链接；智能体按页面可见内容提取，列表页可能一次呈现更多条目。
+- **模型连不上？** 在「设置 → 模型」点「测试连接」查看错误；本地 Ollama 需先 `ollama serve` 且模型已 `pull`。常见错误是 Base URL 多了 `/v1` 或少了 `/v1`，Ollama 用 `http://127.0.0.1:11434/v1`。
+- **端口被占用？** 后端启动命令里的 `--port 8000`、前端 `frontend/vite.config.js` 的 `server.port`（默认 5170）都可以改。
+- **导出的 CSV 用 Excel 打开乱码？** 请用 Excel 的「数据 → 从文本/CSV」并选择 UTF-8。
+- **浏览器打不开？** 确认已执行 `playwright install chromium`，或设置 `BROWSER_CHANNEL=msedge` 复用系统浏览器。
+
+## 合规说明
+
+请仅采集公开、可合法访问的数据，并遵守目标网站的 `robots.txt`、服务条款与当地法律法规。本项目不提供登录绕过、验证码破解或风控规避能力。
 
 ## 测试
 
 ```bash
 python -m unittest discover -s tests
-```
-
-## 目录结构
-
-```
-backend.py         # FastAPI 后端入口（任务/定时/文档库/日志/设置接口 + 前端静态托管）
-frontend/
-  index.html       # 首屏前恢复主题，避免刷新闪白
-  src/
-    views/         # 9 个页面组件（首页 / 智能采集 / 定时任务 / 可视化 / 文档库 / 历史 / 日志 / 帮助 / 设置）
-    api.js         # 后端接口封装
-    router.js      # 路由与页面标题
-    theme.js       # 主题偏好（localStorage + 服务端同步）
-    style.css      # 全局样式与浅色 / 深色变量
-agent_crawler/     # 核心引擎（纯 Python 包）
-  config.py        # 配置加载
-  llm.py           # LLM 客户端封装
-  agent_prompt.py  # 智能体 System Prompt
-  browser.py       # Playwright 工具封装
-  agent.py         # ReAct 决策循环（含各阶段耗时埋点）
-  visualizer.py    # 智能体生成可视化图表方案
-  schema.py        # 动态 Schema 校验
-  storage.py       # SQLite 持久化（任务 / 定时任务 / 文档库与子库）
-  exporter.py      # 多格式导出
-  models.py        # 任务 / 定时任务数据模型
-data/              # 运行时数据：crawler.db、settings.json（均已 gitignore）
-tests/             # 最小单测
 ```

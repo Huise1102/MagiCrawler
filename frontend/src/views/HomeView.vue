@@ -1,210 +1,203 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { createTask, generateSchema, getTask } from '../api'
-import ResultDetail from '../components/ResultDetail.vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 
-const RUNNING = ['pending', 'running']
-const TASK_KEY = 'ac.home.task-id'
+const slides = [
+  {
+    tag: '智能体决策',
+    title: '先看懂页面，再决定下一步',
+    desc: '大模型每一步都观察页面快照，自主判断该点击、翻页还是提取，并把决策过程完整记录成链路。',
+    bullets: ['实时观察 DOM 快照', '自主点选、翻页与重试', '每一步决策都可回看'],
+    chips: ['观察页面', '点击进入', '翻页', '提取字段'],
+    accent: '#2563eb',
+  },
+  {
+    tag: '结构化字段',
+    title: '从一句话，到能分析的表格',
+    desc: '只需描述想采集什么，系统自动识别字段并生成 Schema；价格、时长、数量等会统一成数字。',
+    bullets: ['目标描述自动生成 Schema', '数字、货币、时长自动归一', 'CSV / JSON / Excel 多格式导出'],
+    chips: ['auto_schema', 'price: 12.5', 'duration: 36', 'export.csv'],
+    accent: '#7c3aed',
+  },
+  {
+    tag: '批次归档',
+    title: '每次采集，就是一颗时间胶囊',
+    desc: '同一次采集的结果自动收进一个批次，展开即表格；还能新建子库，把不同批次的成果分门别类存放。',
+    bullets: ['按单次采集自动分组', '子库自由新建与移动', '紧凑表格浏览与检索'],
+    chips: ['批次 A · 25 条', '子库：视频素材', '详情快照', '按需导出'],
+    accent: '#0891b2',
+  },
+  {
+    tag: '定时与可视化',
+    title: '采集交给计划，洞察交给图表',
+    desc: '支持间隔与每日定点运行；采集完成后让大模型根据数据生成图表方案，趋势与分布一目了然。',
+    bullets: ['间隔 / 每日定点调度', '模型自动生成图表方案', '任务耗时与失败原因可追踪'],
+    chips: ['每日 09:00', 'ECharts', '趋势图', '耗时分析'],
+    accent: '#059669',
+  },
+]
 
-const form = reactive({ task_desc: '', start_url: '', schema_json: '' })
-const task = ref(null)
-const submitting = ref(false)
-const generating = ref(false)
-const error = ref('')
-const schemaHint = ref('')
-const schemaEdited = ref(false)
-let lastAutoDesc = ''
+const current = ref(0)
 let timer = null
 
-const running = computed(() => !!task.value && RUNNING.includes(task.value.status))
-const busy = computed(() => submitting.value || running.value)
+function go(index) {
+  current.value = (index + slides.length) % slides.length
+}
 
-function stopPolling() {
+function next() {
+  go(current.value + 1)
+}
+
+function prev() {
+  go(current.value - 1)
+}
+
+function startAuto() {
+  stopAuto()
+  timer = setInterval(next, 5200)
+}
+
+function stopAuto() {
   if (timer) {
-    clearTimeout(timer)
+    clearInterval(timer)
     timer = null
   }
 }
 
-async function refresh(id, silent = false) {
-  try {
-    task.value = await getTask(id)
-    if (RUNNING.includes(task.value.status)) {
-      timer = setTimeout(() => refresh(id, silent), 2000)
-    }
-  } catch (e) {
-    if (silent && e.message.includes('不存在')) {
-      forgetTask()
-      return
-    }
-    error.value = e.message
-    stopPolling()
-  }
+function select(index) {
+  go(index)
+  startAuto()
 }
 
-/** 记住当前任务，切换页面或刷新后仍能在首页看到结果卡片。 */
-function rememberTask(id) {
-  localStorage.setItem(TASK_KEY, id)
-}
-
-function forgetTask() {
-  localStorage.removeItem(TASK_KEY)
-}
-
-onMounted(() => {
-  const saved = localStorage.getItem(TASK_KEY)
-  if (saved) refresh(saved, true)
-})
-
-/** 让大模型根据目标描述识别意图并生成字段 Schema。 */
-async function runGenerate(auto = false) {
-  if (busy.value || generating.value) return
-  const desc = form.task_desc.trim()
-  if (!desc) {
-    if (!auto) error.value = '请先填写「目标描述」，再生成字段。'
-    return
-  }
-
-  generating.value = true
-  if (!auto) error.value = ''
-  schemaHint.value = '正在根据目标描述识别字段……'
-  try {
-    const res = await generateSchema({ task_desc: desc, start_url: form.start_url.trim() })
-    form.schema_json = res.schema_json
-    schemaEdited.value = false
-    lastAutoDesc = desc
-    schemaHint.value = `已识别 ${res.field_count} 个字段，可按需微调。`
-  } catch (e) {
-    schemaHint.value = ''
-    if (auto) {
-      schemaHint.value = '自动识别失败，可点击「AI 生成字段」重试。'
-    } else {
-      error.value = e.message
-    }
-  } finally {
-    generating.value = false
-  }
-}
-
-/** 目标描述失焦时，若字段为空或描述已改动则自动生成。 */
-function maybeAutoGenerate() {
-  if (busy.value || generating.value || schemaEdited.value) return
-  if (!form.task_desc.trim()) return
-  if (form.schema_json.trim() && form.task_desc.trim() === lastAutoDesc) return
-  runGenerate(true)
-}
-
-function onSchemaInput() {
-  schemaEdited.value = true
-  schemaHint.value = ''
-}
-
-async function submit() {
-  error.value = ''
-  if (!form.task_desc.trim() || !form.start_url.trim()) {
-    error.value = '请完整填写「目标描述」与「起始网址」。'
-    return
-  }
-
-  if (!form.schema_json.trim()) {
-    await runGenerate()
-    if (!form.schema_json.trim()) return
-  }
-
-  try {
-    JSON.parse(form.schema_json)
-  } catch (e) {
-    error.value = `Schema 不是合法 JSON：${e.message}`
-    return
-  }
-
-  submitting.value = true
-  stopPolling()
-  try {
-    const res = await createTask({
-      task_desc: form.task_desc.trim(),
-      start_url: form.start_url.trim(),
-      schema_json: form.schema_json.trim(),
-    })
-    rememberTask(res.task_id)
-    await refresh(res.task_id)
-  } catch (e) {
-    error.value = e.message
-  } finally {
-    submitting.value = false
-  }
-}
-
-onBeforeUnmount(stopPolling)
+onMounted(startAuto)
+onBeforeUnmount(stopAuto)
 </script>
 
 <template>
-  <section class="page">
-    <header class="page-head">
-      <h1>智能体爬虫</h1>
-      <p class="sub">
-        填写目标描述与起始网址，AI 自动识别采集字段并完成网页抓取，输出结构化数据。
-      </p>
-    </header>
-
-    <form class="card form-card" @submit.prevent="submit">
-      <div class="grid-2">
-        <label class="field">
-          <span>目标描述</span>
-          <input
-            v-model="form.task_desc"
-            :disabled="busy"
-            placeholder="例：抓取某图书网站「计算机」分类下前 10 本书的书名与价格"
-            @blur="maybeAutoGenerate"
-          />
-        </label>
-        <label class="field">
-          <span>起始网址</span>
-          <input
-            v-model="form.start_url"
-            :disabled="busy"
-            placeholder="https://example.com/books"
-            @blur="maybeAutoGenerate"
-          />
-        </label>
-      </div>
-
-      <div class="field">
-        <span class="label-row">
-          字段 Schema（JSON）
-          <button
-            type="button"
-            class="btn ghost small"
-            :disabled="busy || generating"
-            @click="runGenerate()"
-          >
-            {{ generating ? '识别中……' : 'AI 生成字段' }}
-          </button>
+  <section class="page intro-page">
+    <div class="hero">
+      <div class="hero-copy">
+        <span class="hero-badge">
+          <span class="hero-badge-dot" />
+          多模型驱动 · 本地优先 · 数据留在本机
         </span>
-        <textarea
-          v-model="form.schema_json"
-          :disabled="busy || generating"
-          rows="9"
-          spellcheck="false"
-          placeholder="填写目标描述后，大模型会自动识别字段；也可点击右上角按钮手动生成"
-          @input="onSchemaInput"
-        />
-        <small v-if="generating">正在根据目标描述识别字段……</small>
-        <small v-else>
-          {{ schemaHint || '字段由大模型根据目标描述自动生成，可手动微调。' }}
-        </small>
+        <h1>
+          让 AI 替你读懂网页<br />
+          <span class="hero-highlight">把页面变成可分析的数据</span>
+        </h1>
+        <p class="hero-sub">
+          描述采集目标、给出起始网址，智能体会自己浏览页面、识别字段、翻页提取，
+          并把每一次采集归档成结构化数据。
+        </p>
+        <div class="hero-actions">
+          <RouterLink to="/crawl" class="btn primary large">
+            开始智能采集
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 12h14M13 6l6 6-6 6" />
+            </svg>
+          </RouterLink>
+          <RouterLink to="/help" class="btn ghost large">遇到问题？查看帮助</RouterLink>
+        </div>
+        <div class="hero-tags">
+          <span>本地 Ollama</span>
+          <span>OpenAI 兼容接口</span>
+          <span>定时采集</span>
+          <span>可视化分析</span>
+        </div>
       </div>
 
-      <div v-if="error" class="alert error">{{ error }}</div>
+      <div class="hero-carousel" @mouseenter="stopAuto" @mouseleave="startAuto">
+        <div class="carousel-head">
+          <span class="carousel-kicker">它能做什么</span>
+          <div class="carousel-buttons">
+            <button type="button" aria-label="上一张" @click="select((current - 1 + slides.length) % slides.length)">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M15 18l-6-6 6-6" />
+              </svg>
+            </button>
+            <button type="button" aria-label="下一张" @click="select((current + 1) % slides.length)">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 6l6 6-6 6" />
+              </svg>
+            </button>
+          </div>
+        </div>
 
-      <div class="actions">
-        <button type="submit" class="btn primary" :disabled="busy || generating">
-          {{ submitting ? '爬取中……' : generating ? '生成字段中……' : '开始爬取' }}
-        </button>
-        <span v-if="task" class="hint">任务 ID：{{ task.id.slice(0, 8) }}</span>
+        <div class="carousel-stage">
+          <article
+            v-for="(slide, index) in slides"
+            :key="slide.tag"
+            class="hero-slide"
+            :class="{ active: index === current }"
+            :style="{ '--slide-accent': slide.accent }"
+          >
+            <span class="slide-tag">{{ slide.tag }}</span>
+            <h2>{{ slide.title }}</h2>
+            <p>{{ slide.desc }}</p>
+            <ul class="slide-points">
+              <li v-for="point in slide.bullets" :key="point">{{ point }}</li>
+            </ul>
+            <div class="slide-visual" aria-hidden="true">
+              <div class="sv-bar">
+                <i /><i /><i />
+                <span>{{ slide.tag }}</span>
+              </div>
+              <div class="sv-body">
+                <div class="sv-line w-90" />
+                <div class="sv-line w-60" />
+                <div class="sv-chips">
+                  <span v-for="chip in slide.chips" :key="chip">{{ chip }}</span>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <div class="carousel-dots">
+          <button
+            v-for="(slide, index) in slides"
+            :key="slide.tag"
+            type="button"
+            :class="{ active: index === current }"
+            :aria-label="slide.tag"
+            @click="select(index)"
+          />
+        </div>
       </div>
-    </form>
+    </div>
 
-    <ResultDetail v-if="task" :task="task" />
+    <section class="intro-features">
+      <article class="feature-card">
+        <span class="feature-icon tone-blue">01</span>
+        <h3>智能体驱动</h3>
+        <p>不再依赖固定选择器。模型观察页面快照，自主决定点击、翻页与提取，页面改版也能重新探索。</p>
+      </article>
+      <article class="feature-card">
+        <span class="feature-icon tone-purple">02</span>
+        <h3>自动字段识别</h3>
+        <p>一句目标描述即可生成 Schema；中文单位、货币与时长在入库前统一转换为数字。</p>
+      </article>
+      <article class="feature-card">
+        <span class="feature-icon tone-cyan">03</span>
+        <h3>按批次归档</h3>
+        <p>每次采集自动成为一个批次，支持自建子库与整批移动，检索、导出、删除都不再零散。</p>
+      </article>
+      <article class="feature-card">
+        <span class="feature-icon tone-green">04</span>
+        <h3>定时与可视化</h3>
+        <p>按间隔或每日定点自动运行；结果交给模型生成图表方案，趋势与分布直接呈现。</p>
+      </article>
+    </section>
+
+    <section class="intro-cta">
+      <div>
+        <h2>准备好采集第一个页面了吗？</h2>
+        <p>本地模型开箱即用，也可以在设置中切换到任意 OpenAI 兼容服务。</p>
+      </div>
+      <div class="intro-cta-actions">
+        <RouterLink to="/crawl" class="btn primary">开始智能采集</RouterLink>
+        <RouterLink to="/settings" class="btn ghost">配置模型</RouterLink>
+      </div>
+    </section>
   </section>
 </template>

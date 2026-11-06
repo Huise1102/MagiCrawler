@@ -3,6 +3,7 @@ import HomeView from './views/HomeView.vue'
 import SchedulesView from './views/SchedulesView.vue'
 import VisualizeView from './views/VisualizeView.vue'
 import DocumentsView from './views/DocumentsView.vue'
+import LogsView from './views/LogsView.vue'
 import HistoryView from './views/HistoryView.vue'
 
 const router = createRouter({
@@ -12,6 +13,7 @@ const router = createRouter({
     { path: '/schedules', name: 'schedules', component: SchedulesView },
     { path: '/visualize', name: 'visualize', component: VisualizeView },
     { path: '/documents', name: 'documents', component: DocumentsView },
+    { path: '/logs', name: 'logs', component: LogsView },
     { path: '/history', name: 'history', component: HistoryView },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
@@ -23,6 +25,7 @@ router.afterEach((to) => {
     schedules: '定时任务',
     visualize: '可视化',
     documents: '文档库',
+    logs: '系统日志',
     history: '历史任务',
   }
   document.title = `${titles[to.name] || '智能体爬虫'} · 智能体爬虫`

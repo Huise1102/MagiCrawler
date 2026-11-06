@@ -88,11 +88,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="page">
-    <header class="page-head row">
-      <div>
-        <h1>系统日志</h1>
-        <p class="sub">后端运行日志，内存保留最近 800 条（服务重启后清空）</p>
-      </div>
+    <div class="page-toolbar">
       <div class="filters">
         <label class="log-switch">
           <input v-model="autoRefresh" type="checkbox" />
@@ -104,7 +100,7 @@ onBeforeUnmount(() => {
         </button>
         <button class="btn ghost" :disabled="clearing" @click="clearAll">清空</button>
       </div>
-    </header>
+    </div>
 
     <div v-if="error" class="alert error">{{ error }}</div>
 

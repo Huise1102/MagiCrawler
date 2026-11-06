@@ -10,6 +10,8 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,11 +23,54 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent_crawler import Agent, LLMClient, Schedule, Task, TASK_STATUS, Visualizer, load_config
+from agent_crawler import (
+    Agent,
+    DocumentClassifier,
+    LLMClient,
+    Schedule,
+    Task,
+    TASK_STATUS,
+    Visualizer,
+    load_config,
+)
 from agent_crawler.exporter import export_result
 from agent_crawler.storage import Storage
 
 logger = logging.getLogger("uvicorn.error")
+
+# 系统日志：把运行期日志写入内存环形缓冲，供“系统日志”页面查看
+_LOG_BUFFER: deque = deque(maxlen=800)
+_LOG_RECORDS = 0
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+class _MemoryLogHandler(logging.Handler):
+    """收集日志记录到内存中（不落盘，重启后清空）。"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        global _LOG_RECORDS
+        try:
+            message = record.getMessage()
+            if record.exc_info:
+                message = f"{message}\n{logging.Formatter().formatException(record.exc_info)}"
+            _LOG_RECORDS += 1
+            _LOG_BUFFER.append(
+                {
+                    "id": _LOG_RECORDS,
+                    "time": datetime.fromtimestamp(record.created).isoformat(timespec="seconds"),
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": message,
+                }
+            )
+        except Exception:  # noqa: BLE001 - 日志收集本身不能抛错
+            pass
+
+
+_memory_handler = _MemoryLogHandler()
+_memory_handler.setLevel(logging.DEBUG)
+logger.addHandler(_memory_handler)
+logging.getLogger().addHandler(_memory_handler)
 
 _app_llm_config, _app_crawler_config = load_config()
 
@@ -194,6 +239,7 @@ async def lifespan(_: FastAPI):
     _reconcile_stale_tasks()
     _init_schedule_times()
     scheduler_task = asyncio.create_task(_scheduler_loop())
+    logger.info("服务启动完成：后端 8000，定时调度已就绪")
     try:
         yield
     finally:
@@ -238,6 +284,100 @@ class VisualizeBody(BaseModel):
     hint: str = ""
 
 
+class SchemaBody(BaseModel):
+    task_desc: str
+    start_url: str = ""
+
+
+# ---------------- 字段 Schema 生成 ----------------
+
+
+_SCHEMA_TYPES = {"string", "number", "integer", "boolean"}
+
+_SCHEMA_PROMPT = (
+    "你是网页数据采集的需求分析助手。根据用户的目标描述（必要时结合起始网址），"
+    "识别要采集的实体，并给出采集字段的 JSON Schema。\n"
+    "只输出紧凑 JSON，格式：\n"
+    '{"type":"object","properties":{"title":{"type":"string","description":"书名"},'
+    '"price":{"type":"number","description":"价格"}},"required":["title"]}\n'
+    "约束：\n"
+    "- 字段名使用英文小写下划线命名，共 3-8 个字段\n"
+    "- type 只能是 string / number / integer / boolean\n"
+    "- description 用中文简短说明字段含义\n"
+    "- required 只列出核心字段\n"
+    "- 不要输出任何解释文字\n"
+)
+
+
+def _clean_generated_schema(data) -> Optional[dict]:
+    """校验 LLM 生成的 Schema，剔除非法字段并统一格式。"""
+    if not isinstance(data, dict):
+        return None
+    props = data.get("properties")
+    if not isinstance(props, dict):
+        # 兼容模型直接返回「字段名 -> 类型」的简单映射
+        props = {
+            k: v
+            for k, v in data.items()
+            if k not in ("type", "properties", "required", "items")
+        }
+    if not props:
+        return None
+
+    cleaned: dict[str, dict] = {}
+    for name, spec in props.items():
+        key = str(name).strip()
+        if not key or len(key) > 40 or len(cleaned) >= 12:
+            continue
+        ftype = "string"
+        desc = ""
+        if isinstance(spec, dict):
+            ftype = str(spec.get("type") or "string").lower()
+            desc = str(spec.get("description") or "").strip()
+        elif isinstance(spec, str):
+            ftype = spec.lower()
+        if ftype not in _SCHEMA_TYPES:
+            ftype = "string"
+        entry: dict = {"type": ftype}
+        if desc:
+            entry["description"] = desc
+        cleaned[key] = entry
+
+    if not cleaned:
+        return None
+
+    schema: dict = {"type": "object", "properties": cleaned}
+    required = data.get("required")
+    if isinstance(required, list):
+        picked = [str(r) for r in required if str(r) in cleaned]
+        if picked:
+            schema["required"] = picked
+    return schema
+
+
+def _generate_schema(task_desc: str, start_url: str) -> dict:
+    """调用 LLM 生成字段 Schema。"""
+    raw = llm_client.chat(
+        [
+            {"role": "system", "content": "你是数据采集字段设计助手，只输出 JSON。"},
+            {
+                "role": "user",
+                "content": f"{_SCHEMA_PROMPT}目标描述：{task_desc}\n起始网址：{start_url or '未提供'}",
+            },
+        ],
+        temperature=0,
+        timeout=60,
+    )
+    schema = _clean_generated_schema(llm_client.extract_json(raw))
+    if not schema:
+        raise ValueError("大模型未返回有效字段，请调整目标描述后重试")
+    return {
+        "schema": schema,
+        "schema_json": json.dumps(schema, ensure_ascii=False, indent=2),
+        "field_count": len(schema["properties"]),
+    }
+
+
 # ---------------- 任务执行 ----------------
 
 
@@ -248,6 +388,7 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
         return
     task.status = TASK_STATUS["RUNNING"]
     storage.save(task)
+    logger.info("任务开始 %s：%s（%s）", task_id[:8], task_desc, start_url)
     try:
         agent = Agent(llm_client, _app_crawler_config)
         result = await asyncio.to_thread(agent.run, task_desc, start_url, schema_json)
@@ -258,12 +399,21 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
         task.timings_json = json.dumps(result.timings or {}, ensure_ascii=False)
         task.status = _status_from(result)
 
+        logger.info(
+            "任务结束 %s：%s，采集 %d 条%s",
+            task_id[:8],
+            task.status,
+            len(result.items),
+            f"（{result.note}）" if result.note else "",
+        )
+
         _trajectories[task_id] = result.trajectory or []
         while len(_trajectories) > _TRAJECTORY_KEEP:
             _trajectories.pop(next(iter(_trajectories)))
     except Exception as e:  # noqa: BLE001
         task.status = TASK_STATUS["FAILED"]
         task.error = str(e)
+        logger.exception("任务失败 %s：%s", task_id[:8], e)
     storage.save(task)
 
 
@@ -292,6 +442,7 @@ async def create_task(body: TaskCreate):
         schema_json=body.schema_json.strip(),
     )
     storage.save(task)
+    logger.info("创建任务 %s：%s", task.id[:8], task.task_desc)
     asyncio.create_task(_run_task(task.id, task.task_desc, task.start_url, task.schema_json))
     return {"task_id": task.id, "status": task.status}
 
@@ -329,10 +480,27 @@ def cancel_task(task_id: str):
         task.status = TASK_STATUS["FAILED"]
         task.error = "已取消"
         storage.save(task)
+        logger.info("取消任务 %s", task_id[:8])
         return {"status": "cancelled"}
     if task.status == TASK_STATUS["RUNNING"]:
         raise HTTPException(status_code=400, detail="任务执行中，暂不支持中断")
     return {"status": task.status}
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str):
+    """删除历史任务记录；文档库中由它同步的文档保留，仅解除关联。"""
+    task = storage.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.status == TASK_STATUS["RUNNING"]:
+        raise HTTPException(status_code=400, detail="任务执行中，暂不支持删除")
+
+    storage.delete(task_id)
+    storage.detach_task_documents(task_id)
+    _trajectories.pop(task_id, None)
+    logger.info("删除任务 %s：%s", task_id[:8], task.task_desc)
+    return {"status": "deleted"}
 
 
 @app.post("/api/tasks/{task_id}/visualize")
@@ -360,6 +528,27 @@ async def visualize_task(task_id: str, body: VisualizeBody):
     return plan
 
 
+@app.post("/api/schema/generate")
+async def generate_schema(body: SchemaBody):
+    """根据目标描述让 LLM 生成字段 Schema。"""
+    task_desc = body.task_desc.strip()
+    if not task_desc:
+        raise HTTPException(status_code=400, detail="请先填写目标描述")
+
+    try:
+        result = await asyncio.to_thread(_generate_schema, task_desc, body.start_url.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail=f"LLM 服务不可用，请确认 Ollama（127.0.0.1:11434）已启动：{e}",
+        ) from e
+
+    logger.info("字段生成：%s → %d 个字段", task_desc[:30], result["field_count"])
+    return result
+
+
 @app.get("/api/tasks/{task_id}/export")
 def export_task(task_id: str, fmt: str = "json"):
     task = storage.get(task_id)
@@ -383,31 +572,207 @@ def export_task(task_id: str, fmt: str = "json"):
 
 
 @app.get("/api/documents")
-def list_documents(limit_tasks: int = 50, limit_per_task: int = 50):
-    """聚合各任务采集到的条目，供文档库页面浏览。"""
-    docs = []
-    for task in storage.list(limit=limit_tasks):
-        if not task.result_json:
+def list_documents(limit: int = 500):
+    """返回文档库内容（爬取结果首次访问时自动入库）。"""
+    _sync_documents()
+    docs = storage.list_documents(limit=limit)
+    return {"items": docs, "total": len(docs)}
+
+
+_TITLE_KEYS = ("title", "name", "标题", "名称", "书名", "姓名", "headline", "article")
+
+
+def _derive_title(fields: dict) -> str:
+    """从字段中挑选合适的标题。"""
+    for key, value in fields.items():
+        if any(k in key.lower() for k in _TITLE_KEYS) and isinstance(value, str) and value.strip():
+            return value.strip()
+    for value in fields.values():
+        if isinstance(value, str) and value.strip() and not value.lower().startswith("http"):
+            return value.strip()
+    return "未命名文档"
+
+
+def _sync_documents() -> None:
+    """把尚未入库的爬取结果同步为文档（每个任务只同步一次，删除后不会重现）。"""
+    for task in storage.list(limit=100):
+        if not task.result_json or storage.is_task_synced(task.id):
             continue
         try:
             items = json.loads(task.result_json)
         except json.JSONDecodeError:
-            continue
-        for idx, item in enumerate(items[:limit_per_task]):
+            items = []
+        for idx, item in enumerate(items[:100]):
             if not isinstance(item, dict):
                 continue
-            docs.append(
-                {
-                    "id": f"{task.id}:{idx}",
-                    "task_id": task.id,
-                    "task_desc": task.task_desc,
-                    "start_url": task.start_url,
-                    "status": task.status,
-                    "created_at": task.created_at,
-                    "fields": item,
-                }
+            storage.insert_linked_document(
+                doc_id=f"{task.id}:{idx}",
+                task_id=task.id,
+                doc_index=idx,
+                title=_derive_title(item),
+                fields_json=json.dumps(item, ensure_ascii=False),
+                created_at=task.created_at,
             )
-    return {"items": docs, "total": len(docs)}
+        storage.mark_task_synced(task.id)
+
+
+# ---------------- 分类与文档 CRUD ----------------
+
+
+class CategoryBody(BaseModel):
+    name: str
+
+
+class DocumentBody(BaseModel):
+    title: str = ""
+    category_id: str = ""
+    fields_json: str = "{}"
+    source_url: str = ""
+
+
+class AutoClassifyBody(BaseModel):
+    limit: int = 200
+
+
+def _clean_document(body: DocumentBody) -> dict:
+    """校验并规范化文档输入。"""
+    title = body.title.strip()
+    category_id = body.category_id.strip()
+    if category_id and not any(c["id"] == category_id for c in storage.list_categories()):
+        raise HTTPException(status_code=400, detail="分类不存在")
+    try:
+        fields = json.loads(body.fields_json or "{}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"字段 JSON 解析失败：{e}") from e
+    if not isinstance(fields, dict):
+        raise HTTPException(status_code=400, detail="字段内容必须是 JSON 对象")
+    return {
+        "title": title or _derive_title(fields),
+        "category_id": category_id,
+        "fields_json": json.dumps(fields, ensure_ascii=False, indent=2),
+        "source_url": body.source_url.strip(),
+    }
+
+
+def _category_name(body: CategoryBody) -> str:
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="分类名称不能为空")
+    if len(name) > 30:
+        raise HTTPException(status_code=400, detail="分类名称不能超过 30 个字符")
+    return name
+
+
+@app.get("/api/categories")
+def list_categories():
+    return {"items": storage.list_categories()}
+
+
+@app.post("/api/categories")
+def create_category(body: CategoryBody):
+    name = _category_name(body)
+    try:
+        return storage.create_category(name)
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=400, detail="分类名称已存在") from e
+
+
+@app.put("/api/categories/{category_id}")
+def update_category(category_id: str, body: CategoryBody):
+    name = _category_name(body)
+    try:
+        ok = storage.update_category(category_id, name)
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=400, detail="分类名称已存在") from e
+    if not ok:
+        raise HTTPException(status_code=404, detail="分类不存在")
+    return {"status": "updated"}
+
+
+@app.delete("/api/categories/{category_id}")
+def delete_category(category_id: str):
+    if not storage.delete_category(category_id):
+        raise HTTPException(status_code=404, detail="分类不存在")
+    return {"status": "deleted"}
+
+
+@app.post("/api/documents")
+def create_document(body: DocumentBody):
+    payload = _clean_document(body)
+    return storage.create_document(**payload)
+
+
+@app.put("/api/documents/{doc_id}")
+def update_document(doc_id: str, body: DocumentBody):
+    payload = _clean_document(body)
+    if not storage.update_document(doc_id, **payload):
+        raise HTTPException(status_code=404, detail="文档不存在")
+    return {"status": "updated"}
+
+
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: str):
+    if not storage.delete_document(doc_id):
+        raise HTTPException(status_code=404, detail="文档不存在")
+    return {"status": "deleted"}
+
+
+@app.post("/api/documents/auto-classify")
+async def auto_classify_documents(body: Optional[AutoClassifyBody] = None):
+    """用 LLM 给未分类文档自动归类（已分类的文档不会被改动）。"""
+    _sync_documents()
+    uncategorized = [d for d in storage.list_documents(limit=1000) if not d["category_id"]]
+    if not uncategorized:
+        return {
+            "classified": 0,
+            "remaining": 0,
+            "created_categories": [],
+            "llm_failed": 0,
+            "note": "没有未分类的文档",
+        }
+
+    limit = max(1, min((body.limit if body else 200), 500))
+    targets = uncategorized[:limit]
+    classifier = DocumentClassifier(llm_client)
+    try:
+        result = await asyncio.to_thread(
+            classifier.classify,
+            targets,
+            [c["name"] for c in storage.list_categories()],
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("自动分类失败")
+        raise HTTPException(status_code=503, detail=f"自动分类失败：{e}") from e
+
+    assignments = result.get("assignments") or {}
+    by_name = {c["name"].lower(): c for c in storage.list_categories()}
+    created: list[str] = []
+    classified = 0
+    for doc_id, name in assignments.items():
+        key = name.lower()
+        category = by_name.get(key)
+        if category is None:
+            try:
+                category = storage.create_category(name)
+            except sqlite3.IntegrityError:
+                by_name = {c["name"].lower(): c for c in storage.list_categories()}
+                category = by_name.get(key)
+                if category is None:
+                    continue
+            else:
+                by_name[key] = category
+                created.append(name)
+        if storage.set_document_category(doc_id, category["id"]):
+            classified += 1
+
+    logger.info("自动分类完成：归类 %d 篇，新建分类 %d 个", classified, len(created))
+    return {
+        "classified": classified,
+        "remaining": len(uncategorized) - classified,
+        "created_categories": created,
+        "llm_failed": result.get("llm_failed", 0),
+        "note": "LLM 调用失败，已按来源任务回退归类" if result.get("llm_failed") else "",
+    }
 
 
 # ---------------- 定时任务 CRUD ----------------
@@ -472,6 +837,9 @@ def toggle_schedule(schedule_id: str, body: ToggleBody):
         _compute_next(schedule, datetime.now()) if schedule.enabled else ""
     )
     storage.save_schedule(schedule)
+    logger.info(
+        "定时任务 %s 已%s", schedule.id[:8], "启用" if schedule.enabled else "停用"
+    )
     return schedule.to_row()
 
 
@@ -491,8 +859,42 @@ async def run_schedule_now(schedule_id: str):
     if schedule is None:
         raise HTTPException(status_code=404, detail="定时任务不存在")
     task = _create_schedule_task(schedule)
+    logger.info("手动触发定时任务 %s", schedule.id[:8])
     asyncio.create_task(_run_schedule_task(schedule.id, task.id))
     return {"task_id": task.id, "status": task.status}
+
+
+# ---------------- 系统日志 ----------------------------
+
+
+@app.get("/api/logs")
+def list_logs(level: Optional[str] = None, q: Optional[str] = None, limit: int = 300):
+    """返回最近的后端运行日志（按时间倒序，内存缓冲最多 800 条）。"""
+    limit = max(1, min(limit, 800))
+    entries = list(_LOG_BUFFER)
+    counts = {name: 0 for name in _LOG_LEVELS}
+    for entry in entries:
+        counts[entry["level"]] = counts.get(entry["level"], 0) + 1
+    if level:
+        entries = [e for e in entries if e["level"] == level.upper()]
+    keyword = (q or "").strip().lower()
+    if keyword:
+        entries = [
+            e
+            for e in entries
+            if keyword in e["message"].lower() or keyword in e["logger"].lower()
+        ]
+    total = len(entries)
+    return {"items": list(reversed(entries))[:limit], "total": total, "counts": counts}
+
+
+@app.delete("/api/logs")
+def clear_logs():
+    global _LOG_RECORDS
+    _LOG_BUFFER.clear()
+    _LOG_RECORDS = 0
+    logger.info("系统日志已清空")
+    return {"status": "cleared"}
 
 
 # ---------------- 前端静态资源（Vue 构建产物） ----------------

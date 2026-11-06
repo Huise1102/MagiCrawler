@@ -9,6 +9,7 @@ import {
   updateSchedule,
 } from '../api'
 import StatusBadge from '../components/StatusBadge.vue'
+import { confirmDialog } from '../composables/useConfirm'
 
 const DEFAULT_SCHEMA = JSON.stringify(
   {
@@ -147,7 +148,13 @@ async function toggle(schedule) {
 }
 
 async function remove(schedule) {
-  if (!window.confirm(`确定删除「${schedule.task_desc}」这条定时任务？历史采集结果不会被删除。`)) {
+  const ok = await confirmDialog({
+    title: '删除定时任务',
+    message: `确定删除「${schedule.task_desc}」这条定时任务？历史采集结果不会被删除。`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!ok) {
     return
   }
   error.value = ''
@@ -170,6 +177,11 @@ async function runNow(schedule) {
   } catch (e) {
     error.value = e.message
   }
+}
+
+function shortDesc(text) {
+  const t = (text || '').replace(/\s+/g, ' ').trim()
+  return t.length > 18 ? `${t.slice(0, 18)}…` : t
 }
 
 function scheduleText(schedule) {
@@ -206,7 +218,17 @@ onMounted(load)
 
     <div class="card">
       <div class="table-wrap">
-        <table class="table">
+        <table class="table schedule-table">
+          <colgroup>
+            <col style="width: 17%" />
+            <col style="width: 17%" />
+            <col style="width: 9%" />
+            <col style="width: 7%" />
+            <col style="width: 12%" />
+            <col style="width: 14%" />
+            <col style="width: 6%" />
+            <col style="width: 18%" />
+          </colgroup>
           <thead>
             <tr>
               <th>需求</th>
@@ -221,7 +243,9 @@ onMounted(load)
           </thead>
           <tbody>
             <tr v-for="s in schedules" :key="s.id">
-              <td class="desc" :title="s.task_desc">{{ s.task_desc }}</td>
+              <td class="desc" :title="s.task_desc">
+                <span class="desc-text">{{ shortDesc(s.task_desc) }}</span>
+              </td>
               <td class="url" :title="s.start_url">{{ s.start_url }}</td>
               <td>{{ scheduleText(s) }}</td>
               <td>
@@ -240,7 +264,7 @@ onMounted(load)
               </td>
               <td class="mono">{{ s.run_count }}</td>
               <td class="ops">
-                <button class="btn ghost small" @click="runNow(s)">立即运行</button>
+                <button class="btn ghost small" @click="runNow(s)">运行</button>
                 <button class="btn ghost small" @click="openEdit(s)">编辑</button>
                 <button class="btn ghost small danger" @click="remove(s)">删除</button>
               </td>

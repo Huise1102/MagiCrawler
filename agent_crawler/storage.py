@@ -1,7 +1,8 @@
-"""SQLite 持久化层：任务、定时任务与结果的存取。"""
+"""SQLite 持久化层：任务、定时任务、文档、分类与结果的存取。"""
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from typing import Any, Optional
@@ -45,6 +46,31 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 """
 
+_DOCS_SQL = """
+CREATE TABLE IF NOT EXISTS categories (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS documents (
+    id          TEXT PRIMARY KEY,
+    category_id TEXT NOT NULL DEFAULT '',
+    task_id     TEXT NOT NULL DEFAULT '',
+    doc_index   INTEGER NOT NULL DEFAULT 0,
+    title       TEXT NOT NULL DEFAULT '',
+    fields_json TEXT NOT NULL DEFAULT '{}',
+    source_url  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_task
+    ON documents(task_id, doc_index) WHERE task_id != '';
+CREATE TABLE IF NOT EXISTS synced_tasks (
+    task_id   TEXT PRIMARY KEY,
+    synced_at TEXT NOT NULL
+);
+"""
+
 # 旧库升级：字段名 -> 列定义
 _TASKS_COLUMNS = {
     "schedule_id": "TEXT NOT NULL DEFAULT ''",
@@ -62,6 +88,7 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_TASKS_SQL)
         self._conn.execute(_SCHEDULES_SQL)
+        self._conn.executescript(_DOCS_SQL)
         self._ensure_columns("tasks", _TASKS_COLUMNS)
         self._conn.commit()
 
@@ -133,6 +160,17 @@ class Storage:
         self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         self._conn.commit()
 
+    def detach_task_documents(self, task_id: str) -> None:
+        """删除任务时保留其文档，解除文档与任务的关联。"""
+        from .models import _now
+
+        self._conn.execute(
+            "UPDATE documents SET task_id = '', doc_index = 0, updated_at = ? WHERE task_id = ?",
+            (_now(), task_id),
+        )
+        self._conn.execute("DELETE FROM synced_tasks WHERE task_id = ?", (task_id,))
+        self._conn.commit()
+
     # ---------------- 定时任务 ----------------
 
     def save_schedule(self, schedule: Schedule) -> None:
@@ -198,6 +236,166 @@ class Storage:
     def delete_schedule(self, schedule_id: str) -> None:
         self._conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
         self._conn.commit()
+
+    # ---------------- 分类 ----------------
+
+    def list_categories(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT c.id, c.name, c.created_at,
+                   (SELECT COUNT(*) FROM documents d WHERE d.category_id = c.id) AS count
+            FROM categories c
+            ORDER BY c.created_at, c.name
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_category(self, name: str) -> dict[str, Any]:
+        from .models import _new_id, _now
+
+        cid = _new_id()
+        self._conn.execute(
+            "INSERT INTO categories (id, name, created_at) VALUES (?, ?, ?)",
+            (cid, name, _now()),
+        )
+        self._conn.commit()
+        return {"id": cid, "name": name, "count": 0}
+
+    def update_category(self, category_id: str, name: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE categories SET name = ? WHERE id = ?", (name, category_id)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_category(self, category_id: str) -> bool:
+        """删除分类，其下文档归为未分类。"""
+        self._conn.execute(
+            "UPDATE documents SET category_id = '' WHERE category_id = ?", (category_id,)
+        )
+        cur = self._conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # ---------------- 文档 ----------------
+
+    def is_task_synced(self, task_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM synced_tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return row is not None
+
+    def mark_task_synced(self, task_id: str) -> None:
+        from .models import _now
+
+        self._conn.execute(
+            "INSERT OR IGNORE INTO synced_tasks (task_id, synced_at) VALUES (?, ?)",
+            (task_id, _now()),
+        )
+        self._conn.commit()
+
+    def insert_linked_document(
+        self,
+        doc_id: str,
+        task_id: str,
+        doc_index: int,
+        title: str,
+        fields_json: str,
+        created_at: str,
+    ) -> None:
+        """写入爬取产生的文档（已存在则跳过）。"""
+        from .models import _now
+
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO documents
+                (id, category_id, task_id, doc_index, title, fields_json,
+                 source_url, created_at, updated_at)
+            VALUES (?, '', ?, ?, ?, ?, '', ?, ?)
+            """,
+            (doc_id, task_id, doc_index, title, fields_json, created_at, _now()),
+        )
+        self._conn.commit()
+
+    def create_document(
+        self, title: str, category_id: str, fields_json: str, source_url: str
+    ) -> dict[str, Any]:
+        from .models import _new_id, _now
+
+        did = _new_id()
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO documents
+                (id, category_id, task_id, doc_index, title, fields_json,
+                 source_url, created_at, updated_at)
+            VALUES (?, ?, '', 0, ?, ?, ?, ?, ?)
+            """,
+            (did, category_id, title, fields_json, source_url, now, now),
+        )
+        self._conn.commit()
+        return {"id": did}
+
+    def update_document(
+        self,
+        doc_id: str,
+        title: str,
+        category_id: str,
+        fields_json: str,
+        source_url: str,
+    ) -> bool:
+        from .models import _now
+
+        cur = self._conn.execute(
+            """
+            UPDATE documents
+               SET title = ?, category_id = ?, fields_json = ?, source_url = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (title, category_id, fields_json, source_url, _now(), doc_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_document(self, doc_id: str) -> bool:
+        cur = self._conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_document_category(self, doc_id: str, category_id: str) -> bool:
+        """只更新文档所属分类（自动分类使用，避免覆盖其它字段）。"""
+        from .models import _now
+
+        cur = self._conn.execute(
+            "UPDATE documents SET category_id = ?, updated_at = ? WHERE id = ?",
+            (category_id, _now(), doc_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def list_documents(self, limit: int = 500) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT d.*, c.name AS category_name, t.task_desc AS task_desc
+            FROM documents d
+            LEFT JOIN categories c ON c.id = d.category_id
+            LEFT JOIN tasks t ON t.id = d.task_id
+            ORDER BY d.created_at DESC, d.rowid DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        docs: list[dict[str, Any]] = []
+        for row in rows:
+            doc = dict(row)
+            raw = doc.pop("fields_json", "") or "{}"
+            try:
+                doc["fields"] = json.loads(raw)
+            except json.JSONDecodeError:
+                doc["fields"] = {}
+            doc["manual"] = not doc["task_id"]
+            docs.append(doc)
+        return docs
 
     def close(self) -> None:
         self._conn.close()

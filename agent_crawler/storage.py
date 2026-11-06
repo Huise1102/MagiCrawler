@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS categories (
 CREATE TABLE IF NOT EXISTS documents (
     id          TEXT PRIMARY KEY,
     category_id TEXT NOT NULL DEFAULT '',
+    library_id  TEXT NOT NULL DEFAULT '',
     task_id     TEXT NOT NULL DEFAULT '',
     doc_index   INTEGER NOT NULL DEFAULT 0,
     title       TEXT NOT NULL DEFAULT '',
@@ -69,12 +70,20 @@ CREATE TABLE IF NOT EXISTS synced_tasks (
     task_id   TEXT PRIMARY KEY,
     synced_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS libraries (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
 """
 
 # 旧库升级：字段名 -> 列定义
 _TASKS_COLUMNS = {
     "schedule_id": "TEXT NOT NULL DEFAULT ''",
     "timings_json": "TEXT NOT NULL DEFAULT ''",
+}
+_DOC_COLUMNS = {
+    "library_id": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -90,6 +99,7 @@ class Storage:
         self._conn.execute(_SCHEDULES_SQL)
         self._conn.executescript(_DOCS_SQL)
         self._ensure_columns("tasks", _TASKS_COLUMNS)
+        self._ensure_columns("documents", _DOC_COLUMNS)
         self._conn.commit()
 
     def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
@@ -277,6 +287,97 @@ class Storage:
         self._conn.commit()
         return cur.rowcount > 0
 
+    # ---------------- 子库 ----------------
+
+    def list_libraries(self) -> list[dict[str, Any]]:
+        """子库列表；id 为空的「默认库」始终排在最前。"""
+        rows = self._conn.execute(
+            """
+            SELECT l.id, l.name, l.created_at,
+                   (SELECT COUNT(*) FROM documents d WHERE d.library_id = l.id) AS doc_count,
+                   (SELECT COUNT(DISTINCT d.task_id) FROM documents d
+                     WHERE d.library_id = l.id AND d.task_id != '') AS task_count
+            FROM libraries l
+            ORDER BY l.created_at, l.name
+            """
+        ).fetchall()
+        default_docs = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM documents WHERE library_id = ''"
+        ).fetchone()["c"]
+        default_tasks = self._conn.execute(
+            "SELECT COUNT(DISTINCT task_id) AS c FROM documents"
+            " WHERE library_id = '' AND task_id != ''"
+        ).fetchone()["c"]
+        items = [
+            {
+                "id": "",
+                "name": "默认库",
+                "created_at": "",
+                "doc_count": default_docs,
+                "task_count": default_tasks,
+                "default": True,
+            }
+        ]
+        items.extend(dict(r) for r in rows)
+        return items
+
+    def create_library(self, name: str) -> dict[str, Any]:
+        from .models import _new_id, _now
+
+        lid = _new_id()
+        self._conn.execute(
+            "INSERT INTO libraries (id, name, created_at) VALUES (?, ?, ?)",
+            (lid, name, _now()),
+        )
+        self._conn.commit()
+        return {"id": lid, "name": name}
+
+    def update_library(self, library_id: str, name: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE libraries SET name = ? WHERE id = ?", (name, library_id)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_library(self, library_id: str) -> bool:
+        """删除子库，其下文档回到默认库。"""
+        from .models import _now
+
+        self._conn.execute(
+            "UPDATE documents SET library_id = '', updated_at = ? WHERE library_id = ?",
+            (_now(), library_id),
+        )
+        cur = self._conn.execute("DELETE FROM libraries WHERE id = ?", (library_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_task_library(self, task_id: str, library_id: str) -> int:
+        """把一次采集产生的全部文档移入指定子库。"""
+        from .models import _now
+
+        cur = self._conn.execute(
+            "UPDATE documents SET library_id = ?, updated_at = ? WHERE task_id = ?",
+            (library_id, _now(), task_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def delete_task_documents(self, task_id: str) -> int:
+        """删除一次采集批次下的所有文档（保留同步标记，避免自动复活）。"""
+        cur = self._conn.execute("DELETE FROM documents WHERE task_id = ?", (task_id,))
+        self._conn.commit()
+        return cur.rowcount
+
+    def set_document_library(self, doc_id: str, library_id: str) -> bool:
+        from .models import _now
+
+        cur = self._conn.execute(
+            "UPDATE documents SET library_id = ?, updated_at = ? WHERE id = ?",
+            (library_id, _now(), doc_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     # ---------------- 文档 ----------------
 
     def is_task_synced(self, task_id: str) -> bool:
@@ -309,16 +410,16 @@ class Storage:
         self._conn.execute(
             """
             INSERT OR IGNORE INTO documents
-                (id, category_id, task_id, doc_index, title, fields_json,
+                (id, category_id, library_id, task_id, doc_index, title, fields_json,
                  source_url, created_at, updated_at)
-            VALUES (?, '', ?, ?, ?, ?, '', ?, ?)
+            VALUES (?, '', '', ?, ?, ?, ?, '', ?, ?)
             """,
             (doc_id, task_id, doc_index, title, fields_json, created_at, _now()),
         )
         self._conn.commit()
 
     def create_document(
-        self, title: str, category_id: str, fields_json: str, source_url: str
+        self, title: str, library_id: str, fields_json: str, source_url: str
     ) -> dict[str, Any]:
         from .models import _new_id, _now
 
@@ -327,11 +428,11 @@ class Storage:
         self._conn.execute(
             """
             INSERT INTO documents
-                (id, category_id, task_id, doc_index, title, fields_json,
+                (id, category_id, library_id, task_id, doc_index, title, fields_json,
                  source_url, created_at, updated_at)
-            VALUES (?, ?, '', 0, ?, ?, ?, ?, ?)
+            VALUES (?, '', ?, '', 0, ?, ?, ?, ?, ?)
             """,
-            (did, category_id, title, fields_json, source_url, now, now),
+            (did, library_id, title, fields_json, source_url, now, now),
         )
         self._conn.commit()
         return {"id": did}
@@ -340,7 +441,7 @@ class Storage:
         self,
         doc_id: str,
         title: str,
-        category_id: str,
+        library_id: str,
         fields_json: str,
         source_url: str,
     ) -> bool:
@@ -349,10 +450,10 @@ class Storage:
         cur = self._conn.execute(
             """
             UPDATE documents
-               SET title = ?, category_id = ?, fields_json = ?, source_url = ?, updated_at = ?
+               SET title = ?, library_id = ?, fields_json = ?, source_url = ?, updated_at = ?
              WHERE id = ?
             """,
-            (title, category_id, fields_json, source_url, _now(), doc_id),
+            (title, library_id, fields_json, source_url, _now(), doc_id),
         )
         self._conn.commit()
         return cur.rowcount > 0
@@ -376,9 +477,10 @@ class Storage:
     def list_documents(self, limit: int = 500) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             """
-            SELECT d.*, c.name AS category_name, t.task_desc AS task_desc
+            SELECT d.*, COALESCE(l.name, '默认库') AS library_name,
+                   t.task_desc AS task_desc
             FROM documents d
-            LEFT JOIN categories c ON c.id = d.category_id
+            LEFT JOIN libraries l ON l.id = d.library_id
             LEFT JOIN tasks t ON t.id = d.task_id
             ORDER BY d.created_at DESC, d.rowid DESC
             LIMIT ?

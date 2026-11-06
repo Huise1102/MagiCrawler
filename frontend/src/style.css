@@ -172,6 +172,18 @@ code,
   color: #374151;
 }
 
+.label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.label-row .btn.small {
+  padding: 3px 10px;
+  font-weight: 500;
+}
+
 input,
 textarea,
 select {
@@ -541,10 +553,53 @@ small {
 }
 
 .table .desc {
-  max-width: 460px;
+  max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.desc-text {
+  display: inline-block;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+/* ---------------- 定时任务表格（紧凑排版，避免横向滚动） ---------------- */
+
+.schedule-table {
+  table-layout: fixed;
+}
+
+.schedule-table th,
+.schedule-table td {
+  padding: 8px 10px;
+  white-space: normal;
+}
+
+.schedule-table .desc-text,
+.schedule-table .url {
+  max-width: 100%;
+}
+
+.schedule-table .ops {
+  white-space: nowrap;
+}
+
+.schedule-table .ops .btn.small {
+  padding: 4px 8px;
+  font-size: 12.5px;
+}
+
+.schedule-table .ops .btn.small + .btn.small {
+  margin-left: 4px;
+}
+
+.schedule-table .badge {
+  margin-left: 4px;
 }
 
 .table .ops {
@@ -972,6 +1027,144 @@ small {
   margin-top: 20px;
 }
 
+.doc-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.doc-ops {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.doc-ops-btns {
+  display: flex;
+  gap: 6px;
+}
+
+.cat-tag {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 12px;
+}
+
+.category-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.cat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: #475569;
+  border-radius: 999px;
+  padding: 6px 13px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.cat-chip:hover {
+  border-color: #c7d4ea;
+  background: #f7f9fd;
+}
+
+.cat-chip.active {
+  background: #eef2ff;
+  border-color: #c7d3fc;
+  color: #3730a3;
+  font-weight: 600;
+}
+
+.cat-count {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.cat-chip.active .cat-count {
+  color: #4338ca;
+}
+
+.cat-chip.manage {
+  border-style: dashed;
+  color: var(--accent);
+}
+
+.modal.narrow {
+  width: min(560px, 100%);
+}
+
+.modal.wide {
+  width: min(1000px, 100%);
+}
+
+/* 弹窗内嵌结果详情：去掉卡片外壳，交由弹窗提供边框与内边距 */
+.modal-body .result-card {
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+}
+
+a.btn:hover {
+  text-decoration: none;
+}
+
+.btn.primary.danger {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+  box-shadow: 0 8px 20px rgba(220, 38, 38, 0.24);
+}
+
+.btn.primary.danger:hover:not(:disabled) {
+  background: linear-gradient(135deg, #b91c1c, #991b1b);
+}
+
+.confirm-message {
+  margin: 0;
+  color: #374151;
+  font-size: 14.5px;
+  line-height: 1.75;
+  word-break: break-word;
+}
+
+.cat-add {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.cat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.cat-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cat-row input {
+  flex: 1;
+}
+
 .doc-detail-sub {
   margin: 0;
   color: var(--muted);
@@ -1012,7 +1205,118 @@ small {
   font-size: 13.5px;
 }
 
+/* ---------------- 系统日志 ---------------- */
+
+.log-count {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.log-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.log-list {
+  background: #fbfcfe;
+  max-height: 68vh;
+  overflow: auto;
+}
+
+.log-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 16px;
+  border-bottom: 1px dashed #e9eef7;
+  font-size: 13px;
+}
+
+.log-row:last-child {
+  border-bottom: none;
+}
+
+.log-row:hover {
+  background: #f5f8fe;
+}
+
+.log-time {
+  flex: 0 0 140px;
+  color: #94a3b8;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.log-level {
+  flex: 0 0 72px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.log-source {
+  flex: 0 0 110px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-msg {
+  flex: 1;
+  min-width: 0;
+  color: #334155;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-level-debug {
+  color: #64748b;
+}
+
+.log-level-info {
+  color: #2563eb;
+}
+
+.log-level-warning {
+  color: #d97706;
+}
+
+.log-level-error,
+.log-level-critical {
+  color: #dc2626;
+}
+
+.log-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.log-switch input {
+  width: auto;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
 @media (max-width: 760px) {
+  .chart-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .table .ops {
+    flex-wrap: wrap;
+  }
+
   .doc-search {
     width: 100%;
   }
@@ -1028,6 +1332,19 @@ small {
   .doc-detail-row {
     flex-direction: column;
     gap: 4px;
+  }
+
+  .log-row {
+    flex-wrap: wrap;
+    gap: 4px 10px;
+  }
+
+  .log-time {
+    flex-basis: 118px;
+  }
+
+  .log-msg {
+    flex-basis: 100%;
   }
 }
 

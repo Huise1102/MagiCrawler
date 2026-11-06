@@ -161,11 +161,14 @@ class Agent:
                 if target and len(collected) >= target:
                     note = self._build_note(collected, task_desc)
                     return RunResult(items=collected, note=note, trajectory=trajectory)
-                snapshot = tools.snapshot(self.config.max_snapshot_chars)
                 if len(collected) > before:
                     no_progress = 0
                 else:
                     no_progress += 1
+                    # 连续提取无新增：内容已重复或页面无可提取项，及时收尾而不是耗到超时
+                    if no_progress >= 2:
+                        note = f"连续 {no_progress} 次提取没有新增数据，已终止。{self._build_note(collected, task_desc)}"
+                        return RunResult(items=collected, note=note, trajectory=trajectory)
                 continue
 
             # 3) 其它浏览器动作
@@ -264,7 +267,9 @@ class Agent:
             return []
         snapshot = tools.snapshot(self.config.max_snapshot_chars)
         names = ", ".join(f.name for f in fields)
-        limit = f"最多 {remain} 条。" if remain else ""
+        # 单次提取的条数上限：Qwen 等本地模型逐 token 生成，条数过多会超出单次调用超时
+        cap = min(remain, 20) if remain else 20
+        limit = f"最多 {cap} 条。"
         prompt = (
             f"从页面中提取满足条件的条目，{limit}"
             '只输出紧凑 JSON（单行、无缩进、无多余空白），格式 {"items":[{...}]}。'
@@ -313,10 +318,15 @@ class Agent:
 
     @staticmethod
     def _target_count(task_desc: str) -> int | None:
-        """从目标描述里粗略提取期望数量（如"前 10 本"）。"""
+        """从目标描述里粗略提取期望数量（如"前 10 本"、"前 20 台"）。"""
         import re
 
-        m = re.search(r"(?:前|首个|top\s*)?(\d+)\s*(?:本|条|个|项|个条目)", task_desc or "", re.IGNORECASE)
+        m = re.search(
+            r"(?:前|首个|top\s*)?(\d+)\s*"
+            r"(?:本|条|个|项|台|款|件|册|篇|名|家|种|套|张|页|次|部|只|盒|瓶|箱)",
+            task_desc or "",
+            re.IGNORECASE,
+        )
         return int(m.group(1)) if m else None
 
     @classmethod

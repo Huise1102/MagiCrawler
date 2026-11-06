@@ -1,53 +1,104 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import {
-  autoClassifyDocuments,
-  createCategory,
   createDocument,
-  deleteCategory,
+  createLibrary,
   deleteDocument,
+  deleteDocumentBatch,
+  deleteLibrary,
   exportUrl,
-  listCategories,
   listDocuments,
-  updateCategory,
+  listLibraries,
+  moveTaskLibrary,
   updateDocument,
+  updateLibrary,
 } from '../api'
-
 import { confirmDialog } from '../composables/useConfirm'
 
-const PAGE_SIZE = 24
+const ALL = '__all'
+const MANUAL = '__manual'
 
 const docs = ref([])
-const categories = ref([])
+const libraries = ref([])
+const activeLibrary = ref(ALL)
+const query = ref('')
 const loading = ref(false)
 const error = ref('')
-const query = ref('')
-const activeCategory = ref('')
-const visibleCount = ref(PAGE_SIZE)
-
+const expanded = ref([])
 const selected = ref(null)
-const editor = ref(null)
-const showCategories = ref(false)
-const categoryDrafts = ref([])
-const newCategoryName = ref('')
-const categoryError = ref('')
-const classifyBusy = ref(false)
-const notice = ref('')
 
-const TITLE_PATTERN = /title|name|标题|名称|书名|姓名|article|headline|产品/i
-const LINK_PATTERN = /url|link|href|网址|链接|地址/i
+const editor = ref(null)
+const libManager = ref(false)
+const libDrafts = ref({})
+const newLibName = ref('')
+const libError = ref('')
+
+const activeLibName = computed(() => {
+  if (activeLibrary.value === ALL) return '全部'
+  return libraries.value.find((l) => l.id === activeLibrary.value)?.name || '默认库'
+})
+
+function libraryName(id) {
+  return libraries.value.find((l) => l.id === (id || ''))?.name || '默认库'
+}
+
+/** 按单次采集分组：task_id 相同的文档归为一个批次，手动文档单独一组。 */
+const batches = computed(() => {
+  const q = query.value.trim().toLowerCase()
+  const groups = new Map()
+
+  for (const doc of docs.value) {
+    if (activeLibrary.value !== ALL && (doc.library_id || '') !== activeLibrary.value) continue
+    if (q) {
+      const hay = `${doc.title || ''} ${doc.task_desc || ''} ${JSON.stringify(doc.fields || {})}`.toLowerCase()
+      if (!hay.includes(q)) continue
+    }
+    const key = doc.task_id || MANUAL
+    let group = groups.get(key)
+    if (!group) {
+      group = {
+        key,
+        task_id: doc.task_id || '',
+        title: doc.task_desc || (doc.task_id ? '未命名采集' : '手动文档'),
+        created_at: doc.created_at || '',
+        library_id: doc.library_id || '',
+        docs: [],
+      }
+      groups.set(key, group)
+    }
+    group.docs.push(doc)
+  }
+
+  const list = [...groups.values()]
+  for (const g of list) {
+    g.library_name = libraryName(g.library_id)
+    const cols = []
+    for (const doc of g.docs) {
+      for (const key of Object.keys(doc.fields || {})) {
+        if (!cols.includes(key)) cols.push(key)
+      }
+    }
+    g.cols = cols
+  }
+  return list.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+})
+
+const totalDocs = computed(() => batches.value.reduce((n, b) => n + b.docs.length, 0))
 
 async function load() {
   loading.value = true
   error.value = ''
   try {
-    const [docRes, catRes] = await Promise.all([listDocuments(), listCategories()])
+    const docRes = await listDocuments()
     docs.value = docRes.items || []
-    categories.value = catRes.items || []
-    if (activeCategory.value && activeCategory.value !== '__none') {
-      if (!categories.value.some((c) => c.id === activeCategory.value)) activeCategory.value = ''
+    const libRes = await listLibraries()
+    libraries.value = libRes.items || []
+    if (
+      activeLibrary.value !== ALL &&
+      !libraries.value.some((l) => l.id === activeLibrary.value)
+    ) {
+      activeLibrary.value = ALL
     }
-    visibleCount.value = PAGE_SIZE
   } catch (e) {
     error.value = e.message
   } finally {
@@ -55,95 +106,79 @@ async function load() {
   }
 }
 
-const counts = computed(() => {
-  const map = {}
-  for (const d of docs.value) {
-    const key = d.category_id || ''
-    map[key] = (map[key] || 0) + 1
-  }
-  return map
-})
-
-const uncategorizedCount = computed(() => counts.value[''] || 0)
-
-function categoryCount(id) {
-  return counts.value[id] || 0
+function isExpanded(key) {
+  return expanded.value.includes(key)
 }
 
-const filteredDocs = computed(() => {
-  const q = query.value.trim().toLowerCase()
-  return docs.value.filter((d) => {
-    if (activeCategory.value === '__none') {
-      if (d.category_id) return false
-    } else if (activeCategory.value && d.category_id !== activeCategory.value) {
-      return false
-    }
-    if (!q) return true
-    return `${d.title || ''} ${d.task_desc || ''} ${JSON.stringify(d.fields)}`.toLowerCase().includes(q)
-  })
-})
-
-const visibleDocs = computed(() => filteredDocs.value.slice(0, visibleCount.value))
-
-function isLinkField(key, value) {
-  return typeof value === 'string' && (/^https?:\/\//i.test(value) || LINK_PATTERN.test(key))
+function toggle(key) {
+  expanded.value = isExpanded(key)
+    ? expanded.value.filter((k) => k !== key)
+    : [...expanded.value, key]
 }
 
-function titleOf(doc) {
-  if (doc.title && doc.title.trim()) return doc.title.trim()
-  for (const [k, v] of Object.entries(doc.fields)) {
-    if (TITLE_PATTERN.test(k) && typeof v === 'string' && v.trim()) return v.trim()
-  }
-  return '未命名文档'
-}
-
-function linkOf(doc) {
-  if (doc.source_url) return doc.source_url
-  for (const [k, v] of Object.entries(doc.fields)) {
-    if (isLinkField(k, v)) return v
-  }
-  return ''
-}
-
-function previewFields(doc) {
-  return Object.entries(doc.fields)
-    .filter(
-      ([k, v]) =>
-        v !== null &&
-        v !== undefined &&
-        v !== '' &&
-        !isLinkField(k, v) &&
-        !TITLE_PATTERN.test(k),
-    )
-    .slice(0, 4)
-}
-
-function formatValue(value) {
+function display(value) {
   if (value === null || value === undefined || value === '') return '—'
-  if (typeof value === 'object') return JSON.stringify(value, null, 2)
+  if (typeof value === 'object') return JSON.stringify(value)
   return String(value)
 }
 
+function cellTitle(value) {
+  const text = display(value)
+  return text.length > 30 ? text : ''
+}
+
 function formatTime(value) {
-  return (value || '').replace('T', ' ')
+  return (value || '').replace('T', ' ').slice(0, 16)
 }
 
-function selectCategory(value) {
-  activeCategory.value = value
-  visibleCount.value = PAGE_SIZE
+/** 把一次采集的整批结果移入子库。 */
+async function moveBatch(batch, event) {
+  const libraryId = event.target.value
+  if (!batch.task_id) {
+    event.target.value = batch.library_id
+    return
+  }
+  try {
+    await moveTaskLibrary(batch.task_id, libraryId)
+    await load()
+  } catch (e) {
+    error.value = e.message
+    event.target.value = batch.library_id
+  }
 }
 
-// ---------------- 文档增删改 ----------------
+async function removeBatch(batch) {
+  const label = batch.task_id ? '这次采集的全部文档' : '这批手动文档'
+  const ok = await confirmDialog({
+    title: '删除文档批次',
+    message: `确定删除「${batch.title}」中的${label}（${batch.docs.length} 条）吗？`,
+    confirmText: '删除',
+  })
+  if (!ok) return
+  try {
+    if (batch.task_id) {
+      await deleteDocumentBatch(batch.task_id)
+    } else {
+      await Promise.all(batch.docs.map((d) => deleteDocument(d.id)))
+    }
+    await load()
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+function openDetail(doc) {
+  selected.value = doc
+}
 
 function openCreate() {
   editor.value = {
     mode: 'create',
     id: '',
     title: '',
-    category_id: activeCategory.value && activeCategory.value !== '__none' ? activeCategory.value : '',
+    library_id: activeLibrary.value === ALL ? '' : activeLibrary.value,
     source_url: '',
-    fields_json: '{\n  "字段": "值"\n}',
-    saving: false,
+    fields_json: '{\n  \n}',
     error: '',
   }
 }
@@ -152,183 +187,122 @@ function openEdit(doc) {
   editor.value = {
     mode: 'edit',
     id: doc.id,
-    title: titleOf(doc),
-    category_id: doc.category_id || '',
+    title: doc.title || '',
+    library_id: doc.library_id || '',
     source_url: doc.source_url || '',
-    fields_json: JSON.stringify(doc.fields, null, 2),
-    saving: false,
+    fields_json: JSON.stringify(doc.fields || {}, null, 2),
     error: '',
   }
 }
 
-async function saveDocument() {
-  if (!editor.value || editor.value.saving) return
-  const draft = editor.value
-  draft.error = ''
+async function saveEditor() {
+  const ed = editor.value
+  if (!ed) return
   let fields
   try {
-    fields = JSON.parse(draft.fields_json || '{}')
+    fields = JSON.parse(ed.fields_json || '{}')
   } catch (e) {
-    draft.error = `字段 JSON 格式有误：${e.message}`
+    ed.error = `字段 JSON 解析失败：${e.message}`
     return
   }
   if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
-    draft.error = '字段内容必须是 JSON 对象'
+    ed.error = '字段内容必须是 JSON 对象'
     return
   }
-  draft.saving = true
+  const payload = {
+    title: ed.title.trim(),
+    library_id: ed.library_id || '',
+    fields_json: JSON.stringify(fields, null, 2),
+    source_url: ed.source_url.trim(),
+  }
   try {
-    const payload = {
-      title: draft.title,
-      category_id: draft.category_id,
-      source_url: draft.source_url,
-      fields_json: JSON.stringify(fields),
+    if (ed.mode === 'create') {
+      await createDocument(payload)
+    } else {
+      await updateDocument(ed.id, payload)
     }
-    if (draft.mode === 'create') await createDocument(payload)
-    else await updateDocument(draft.id, payload)
     editor.value = null
-    selected.value = null
+    if (selected.value) selected.value = null
     await load()
   } catch (e) {
-    draft.error = e.message
-  } finally {
-    draft.saving = false
+    ed.error = e.message
   }
 }
 
 async function removeDocument(doc) {
   const ok = await confirmDialog({
     title: '删除文档',
-    message: `确定删除「${titleOf(doc)}」？删除后不会再次同步。`,
+    message: `确定删除「${doc.title}」吗？`,
     confirmText: '删除',
-    danger: true,
   })
   if (!ok) return
-  error.value = ''
   try {
     await deleteDocument(doc.id)
-    if (selected.value && selected.value.id === doc.id) selected.value = null
+    selected.value = null
     await load()
   } catch (e) {
     error.value = e.message
   }
 }
 
-// ---------------- 分类增删改 ----------------
-
-function openCategoryManager() {
-  categoryError.value = ''
-  newCategoryName.value = ''
-  categoryDrafts.value = categories.value.map((c) => ({ id: c.id, name: c.name, draftName: c.name }))
-  showCategories.value = true
+function openLibraryManager() {
+  libError.value = ''
+  newLibName.value = ''
+  const drafts = {}
+  for (const lib of libraries.value) {
+    if (!lib.default) drafts[lib.id] = lib.name
+  }
+  libDrafts.value = drafts
+  libManager.value = true
 }
 
-async function refreshDrafts() {
-  categoryDrafts.value = categories.value.map((c) => ({ id: c.id, name: c.name, draftName: c.name }))
-}
-
-async function addCategory() {
-  const name = newCategoryName.value.trim()
+async function createLib() {
+  const name = newLibName.value.trim()
   if (!name) {
-    categoryError.value = '请输入分类名称'
+    libError.value = '子库名称不能为空'
     return
   }
-  categoryError.value = ''
   try {
-    await createCategory(name)
-    newCategoryName.value = ''
+    const res = await createLibrary(name)
+    newLibName.value = ''
     await load()
-    await refreshDrafts()
+    activeLibrary.value = res.id
+    libDrafts.value[res.id] = res.name
+    libError.value = ''
   } catch (e) {
-    categoryError.value = e.message
+    libError.value = e.message
   }
 }
 
-async function saveCategory(draftItem) {
-  const name = draftItem.draftName.trim()
+async function renameLib(lib) {
+  const name = (libDrafts.value[lib.id] || '').trim()
   if (!name) {
-    categoryError.value = '分类名称不能为空'
+    libError.value = '子库名称不能为空'
     return
   }
-  categoryError.value = ''
   try {
-    await updateCategory(draftItem.id, name)
+    await updateLibrary(lib.id, name)
     await load()
-    await refreshDrafts()
+    libError.value = ''
   } catch (e) {
-    categoryError.value = e.message
+    libError.value = e.message
   }
 }
 
-async function removeCategory(draftItem) {
+async function removeLib(lib) {
   const ok = await confirmDialog({
-    title: '删除分类',
-    message: `删除分类「${draftItem.name}」？其下文档将变为未分类。`,
+    title: '删除子库',
+    message: `确定删除子库「${lib.name}」吗？其中的文档会移回默认库。`,
     confirmText: '删除',
-    danger: true,
   })
   if (!ok) return
-  categoryError.value = ''
   try {
-    await deleteCategory(draftItem.id)
+    await deleteLibrary(lib.id)
+    if (activeLibrary.value === lib.id) activeLibrary.value = ALL
     await load()
-    await refreshDrafts()
+    delete libDrafts.value[lib.id]
   } catch (e) {
-    categoryError.value = e.message
-  }
-}
-
-// ---------------- 自动分类 ----------------
-
-async function runAutoClassify() {
-  if (classifyBusy.value) return
-  notice.value = ''
-  if (!uncategorizedCount.value) {
-    notice.value = '没有未分类的文档'
-    return
-  }
-  classifyBusy.value = true
-  error.value = ''
-  try {
-    const res = await autoClassifyDocuments()
-    const parts = []
-    if (res.classified) parts.push(`已自动归类 ${res.classified} 篇文档`)
-    if (res.created_categories && res.created_categories.length) {
-      parts.push(`新建分类：${res.created_categories.join('、')}`)
-    }
-    if (res.remaining) parts.push(`仍有 ${res.remaining} 篇未归类`)
-    if (res.note) parts.push(res.note)
-    notice.value = parts.length ? parts.join('；') : '没有需要归类的文档'
-    await load()
-  } catch (e) {
-    error.value = e.message
-  } finally {
-    classifyBusy.value = false
-  }
-}
-
-// ---------------- 导出 ----------------
-
-async function downloadExport(fmt) {
-  if (!selected.value || !selected.value.task_id) return
-  error.value = ''
-  try {
-    const res = await fetch(exportUrl(selected.value.task_id, fmt))
-    if (!res.ok) throw new Error(`导出失败（${res.status}）`)
-    const blob = await res.blob()
-    const disposition = res.headers.get('Content-Disposition') || ''
-    const matched = disposition.match(/filename="?([^";]+)"?/)
-    const filename = matched ? matched[1] : `task_${selected.value.task_id.slice(0, 8)}.${fmt}`
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = filename
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    URL.revokeObjectURL(url)
-  } catch (e) {
-    error.value = e.message
+    libError.value = e.message
   }
 }
 
@@ -340,190 +314,262 @@ onMounted(load)
     <header class="page-head row">
       <div>
         <h1>文档库</h1>
-        <p class="sub">按分类整理采集内容，支持新增、编辑与删除</p>
+        <p class="sub">按单次采集归档，可新建子库存放不同采集结果。</p>
       </div>
-      <div class="filters">
-        <input v-model="query" class="doc-search" placeholder="搜索标题、字段或任务……" />
-        <button class="btn ghost" :disabled="classifyBusy || loading" @click="runAutoClassify">
-          {{ classifyBusy ? '分类中……' : '自动分类' }}
-        </button>
-        <button class="btn primary" @click="openCreate">新建文档</button>
-        <button class="btn ghost" :disabled="loading" @click="load">
-          {{ loading ? '加载中……' : '刷新' }}
-        </button>
+      <div class="doc-actions">
+        <input v-model="query" class="doc-search" placeholder="搜索标题、字段或任务描述" />
+        <button type="button" class="btn ghost" @click="openLibraryManager">子库管理</button>
+        <button type="button" class="btn ghost" @click="openCreate">新建文档</button>
+        <button type="button" class="btn ghost" :disabled="loading" @click="load">刷新</button>
       </div>
     </header>
 
     <div v-if="error" class="alert error">{{ error }}</div>
-    <div v-if="notice" class="alert info">{{ notice }}</div>
 
-    <div class="category-bar">
-      <button
-        class="cat-chip"
-        :class="{ active: activeCategory === '' }"
-        @click="selectCategory('')"
-      >
-        全部 <span class="cat-count">{{ docs.length }}</span>
-      </button>
-      <button
-        class="cat-chip"
-        :class="{ active: activeCategory === '__none' }"
-        @click="selectCategory('__none')"
-      >
-        未分类 <span class="cat-count">{{ uncategorizedCount }}</span>
-      </button>
-      <button
-        v-for="c in categories"
-        :key="c.id"
-        class="cat-chip"
-        :class="{ active: activeCategory === c.id }"
-        @click="selectCategory(c.id)"
-      >
-        {{ c.name }} <span class="cat-count">{{ categoryCount(c.id) }}</span>
-      </button>
-      <button class="cat-chip manage" @click="openCategoryManager">分类管理</button>
-    </div>
-
-    <p v-if="docs.length" class="doc-count">
-      共 {{ filteredDocs.length }} 条内容<template v-if="filteredDocs.length !== docs.length">
-        （筛选自 {{ docs.length }} 条）</template
-      >
-    </p>
-
-    <div v-if="visibleDocs.length" class="doc-grid">
-      <article v-for="d in visibleDocs" :key="d.id" class="doc-card" @click="selected = d">
-        <div class="doc-title-row">
-          <h3>{{ titleOf(d) }}</h3>
-          <span v-if="d.manual" class="chip">手动</span>
+    <div class="lib-layout">
+      <aside class="lib-side">
+        <div class="lib-head">
+          <span>存储库</span>
+          <span class="lib-count">{{ libraries.length }}</span>
         </div>
-        <dl v-if="previewFields(d).length" class="doc-fields">
-          <div v-for="[k, v] in previewFields(d)" :key="k" class="doc-field-row">
-            <dt class="doc-key">{{ k }}</dt>
-            <dd class="doc-value">{{ formatValue(v) }}</dd>
-          </div>
-        </dl>
-        <footer class="doc-meta">
-          <span class="doc-source">{{ d.task_desc || '手动创建' }}</span>
-          <span class="mono">{{ formatTime(d.created_at) }}</span>
-        </footer>
-        <div class="doc-ops" @click.stop>
-          <span class="cat-tag">{{ d.category_name || '未分类' }}</span>
-          <div class="doc-ops-btns">
-            <button class="btn ghost small" @click="openEdit(d)">编辑</button>
-            <button class="btn ghost small danger" @click="removeDocument(d)">删除</button>
-          </div>
+        <ul class="lib-list">
+          <li
+            class="lib-item"
+            :class="{ active: activeLibrary === ALL }"
+            @click="activeLibrary = ALL"
+          >
+            <span class="lib-name">全部</span>
+            <span class="lib-count">{{ docs.length }}</span>
+          </li>
+          <li
+            v-for="lib in libraries"
+            :key="lib.id || 'default'"
+            class="lib-item"
+            :class="{ active: activeLibrary === lib.id }"
+            @click="activeLibrary = lib.id"
+          >
+            <span class="lib-name" :title="lib.name">{{ lib.name }}</span>
+            <span class="lib-count">{{ lib.doc_count }}</span>
+          </li>
+        </ul>
+        <p class="lib-tip">新建子库后，可在采集批次右侧选择归属。</p>
+      </aside>
+
+      <div class="lib-main">
+        <div class="lib-summary">
+          <span>{{ totalDocs }} 条记录 · {{ batches.length }} 个批次</span>
+          <span class="lib-filter">{{ activeLibName }}</span>
         </div>
-      </article>
-    </div>
 
-    <div v-if="!visibleDocs.length" class="card">
-      <p class="empty">{{ loading ? '加载中……' : '暂无文档，先执行一次爬取或手动新建吧。' }}</p>
-    </div>
-
-    <div v-if="visibleCount < filteredDocs.length" class="doc-more">
-      <button class="btn ghost" @click="visibleCount += PAGE_SIZE">
-        加载更多（剩余 {{ filteredDocs.length - visibleCount }} 条）
-      </button>
-    </div>
-
-    <!-- 文档详情 -->
-    <div v-if="selected" class="modal-backdrop" @click.self="selected = null">
-      <div class="modal">
-        <div class="modal-head">
-          <h2>{{ titleOf(selected) }}</h2>
-          <button class="modal-close" aria-label="关闭" @click="selected = null">×</button>
-        </div>
-        <div class="modal-body">
-          <p class="doc-detail-sub">
-            <span class="chip">{{ selected.category_name || '未分类' }}</span>
-            {{ selected.task_desc || '手动创建' }} · {{ formatTime(selected.created_at) }}
+        <div v-if="loading" class="card doc-empty"><span class="spinner" /> 加载中……</div>
+        <div v-else-if="!batches.length" class="card doc-empty">
+          <p class="empty">
+            {{
+              query
+                ? '没有匹配的文档，换个关键词试试。'
+                : activeLibrary !== ALL
+                  ? '这个子库还没有文档，可在批次右侧的「归属」中把采集结果移入。'
+                  : '这里还没有文档，完成一次采集后会自动归档。'
+            }}
           </p>
-          <p v-if="linkOf(selected)" class="doc-detail-link">
-            <a :href="linkOf(selected)" target="_blank" rel="noreferrer">{{ linkOf(selected) }}</a>
-          </p>
-          <div class="doc-detail-list">
-            <div v-for="[k, v] in Object.entries(selected.fields)" :key="k" class="doc-detail-row">
-              <span class="doc-key">{{ k }}</span>
-              <span class="doc-detail-value">{{ formatValue(v) }}</span>
+        </div>
+
+        <div v-else class="batch-list">
+          <section v-for="batch in batches" :key="batch.key" class="batch">
+            <header class="batch-head" @click="toggle(batch.key)">
+              <div class="batch-main">
+                <span class="batch-caret" :class="{ open: isExpanded(batch.key) }">▶</span>
+                <div class="batch-title">
+                  <h3 :title="batch.title">{{ batch.title }}</h3>
+                  <p class="batch-sub">
+                    <span>{{ batch.docs.length }} 条</span>
+                    <span>{{ batch.library_name }}</span>
+                    <span v-if="batch.created_at">{{ formatTime(batch.created_at) }}</span>
+                    <span v-if="batch.task_id" class="mono">{{ batch.task_id.slice(0, 8) }}</span>
+                    <span v-else>手动文档</span>
+                  </p>
+                </div>
+              </div>
+              <div class="batch-actions" @click.stop>
+                <span v-if="batch.task_id" class="batch-lib-label">归属</span>
+                <select
+                  v-if="batch.task_id"
+                  :value="batch.library_id"
+                  title="移动到子库"
+                  @change="moveBatch(batch, $event)"
+                >
+                  <option v-for="lib in libraries" :key="lib.id || 'default'" :value="lib.id">
+                    {{ lib.name }}
+                  </option>
+                </select>
+                <a
+                  v-if="batch.task_id"
+                  class="btn ghost small"
+                  :href="exportUrl(batch.task_id, 'csv')"
+                >
+                  CSV
+                </a>
+                <a
+                  v-if="batch.task_id"
+                  class="btn ghost small"
+                  :href="exportUrl(batch.task_id, 'json')"
+                >
+                  JSON
+                </a>
+                <button type="button" class="btn ghost small danger" @click="removeBatch(batch)">
+                  删除
+                </button>
+              </div>
+            </header>
+
+            <div v-if="isExpanded(batch.key)" class="batch-body">
+              <div class="table-wrap">
+                <table class="table batch-table">
+                  <thead>
+                    <tr>
+                      <th class="idx">#</th>
+                      <th v-for="col in batch.cols" :key="col">{{ col }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="(doc, i) in batch.docs" :key="doc.id" @click="openDetail(doc)">
+                      <td class="idx">{{ i + 1 }}</td>
+                      <td
+                        v-for="col in batch.cols"
+                        :key="col"
+                        :title="cellTitle(doc.fields[col])"
+                        :class="{ muted: display(doc.fields[col]) === '—' }"
+                      >
+                        {{ display(doc.fields[col]) }}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p class="batch-hint">表格列由采集字段自动生成，点击任意行查看详情。</p>
             </div>
-          </div>
-        </div>
-        <div class="modal-foot">
-          <button class="btn ghost small danger" @click="removeDocument(selected)">删除</button>
-          <button class="btn ghost small" @click="openEdit(selected)">编辑</button>
-          <template v-if="selected.task_id">
-            <button class="btn ghost small" @click="downloadExport('json')">导出 JSON</button>
-            <button class="btn ghost small" @click="downloadExport('csv')">导出 CSV</button>
-          </template>
-          <button class="btn small" @click="selected = null">关闭</button>
+          </section>
         </div>
       </div>
     </div>
 
-    <!-- 文档新增/编辑 -->
-    <div v-if="editor" class="modal-backdrop" @click.self="editor = null">
+    <!-- 文档详情 -->
+    <div v-if="selected" class="modal-mask" @click.self="selected = null">
+      <div class="modal narrow">
+        <div class="modal-head">
+          <h3 :title="selected.title">{{ selected.title }}</h3>
+          <button type="button" class="modal-close" @click="selected = null">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="doc-meta">
+            <span>归属 {{ selected.library_name }}</span>
+            <span v-if="selected.task_desc">采集：{{ selected.task_desc }}</span>
+            <span>{{ formatTime(selected.created_at) }}</span>
+          </div>
+          <a
+            v-if="selected.source_url"
+            class="doc-link"
+            :href="selected.source_url"
+            target="_blank"
+            rel="noopener"
+          >
+            {{ selected.source_url }}
+          </a>
+          <div class="doc-fields">
+            <div v-for="(value, key) in selected.fields" :key="key" class="doc-field">
+              <span class="doc-key">{{ key }}</span>
+              <span class="doc-value">{{ display(value) }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button type="button" class="btn ghost" @click="openEdit(selected)">编辑</button>
+          <button type="button" class="btn ghost danger" @click="removeDocument(selected)">
+            删除
+          </button>
+          <a
+            v-if="selected.task_id"
+            class="btn ghost"
+            :href="exportUrl(selected.task_id, 'csv')"
+          >
+            导出批次
+          </a>
+          <button type="button" class="btn primary" @click="selected = null">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新建 / 编辑文档 -->
+    <div v-if="editor" class="modal-mask" @click.self="editor = null">
       <div class="modal">
         <div class="modal-head">
-          <h2>{{ editor.mode === 'create' ? '新建文档' : '编辑文档' }}</h2>
-          <button class="modal-close" aria-label="关闭" @click="editor = null">×</button>
+          <h3>{{ editor.mode === 'create' ? '新建文档' : '编辑文档' }}</h3>
+          <button type="button" class="modal-close" @click="editor = null">×</button>
         </div>
         <div class="modal-body">
           <label class="field">
             <span>标题</span>
-            <input v-model="editor.title" placeholder="留空则自动从字段中提取" />
+            <input v-model="editor.title" placeholder="留空则自动从字段中取标题" />
           </label>
-          <div class="grid-2">
-            <label class="field">
-              <span>分类</span>
-              <select v-model="editor.category_id">
-                <option value="">未分类</option>
-                <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
-              </select>
-            </label>
-            <label class="field">
-              <span>原文链接</span>
-              <input v-model="editor.source_url" placeholder="https://…（可选）" />
-            </label>
-          </div>
           <label class="field">
-            <span>字段内容（JSON 对象）</span>
-            <textarea v-model="editor.fields_json" rows="10" spellcheck="false"></textarea>
+            <span>归属子库</span>
+            <select v-model="editor.library_id">
+              <option v-for="lib in libraries" :key="lib.id || 'default'" :value="lib.id">
+                {{ lib.name }}
+              </option>
+            </select>
+          </label>
+          <label class="field">
+            <span>来源网址</span>
+            <input v-model="editor.source_url" placeholder="https://example.com/item/1" />
+          </label>
+          <label class="field">
+            <span>字段（JSON 对象）</span>
+            <textarea v-model="editor.fields_json" rows="10" spellcheck="false" />
           </label>
           <div v-if="editor.error" class="alert error">{{ editor.error }}</div>
         </div>
         <div class="modal-foot">
-          <button class="btn ghost" @click="editor = null">取消</button>
-          <button class="btn primary" :disabled="editor.saving" @click="saveDocument">
-            {{ editor.saving ? '保存中……' : '保存' }}
-          </button>
+          <button type="button" class="btn ghost" @click="editor = null">取消</button>
+          <button type="button" class="btn primary" @click="saveEditor">保存</button>
         </div>
       </div>
     </div>
 
-    <!-- 分类管理 -->
-    <div v-if="showCategories" class="modal-backdrop" @click.self="showCategories = false">
+    <!-- 子库管理 -->
+    <div v-if="libManager" class="modal-mask" @click.self="libManager = false">
       <div class="modal narrow">
         <div class="modal-head">
-          <h2>分类管理</h2>
-          <button class="modal-close" aria-label="关闭" @click="showCategories = false">×</button>
+          <h3>子库管理</h3>
+          <button type="button" class="modal-close" @click="libManager = false">×</button>
         </div>
         <div class="modal-body">
-          <div class="cat-add">
-            <input v-model="newCategoryName" placeholder="新分类名称" @keyup.enter="addCategory" />
-            <button class="btn small" @click="addCategory">添加</button>
+          <div class="lib-manage-add">
+            <input v-model="newLibName" placeholder="输入新子库名称" @keyup.enter="createLib" />
+            <button type="button" class="btn primary" @click="createLib">新建</button>
           </div>
-          <div v-if="categoryError" class="alert error">{{ categoryError }}</div>
-          <div class="cat-list">
-            <div v-for="c in categoryDrafts" :key="c.id" class="cat-row">
-              <input v-model="c.draftName" />
-              <button class="btn ghost small" @click="saveCategory(c)">保存</button>
-              <button class="btn ghost small danger" @click="removeCategory(c)">删除</button>
+          <p class="lib-manage-tip">删除子库时，其中的文档会自动移回默认库。</p>
+          <div v-if="libError" class="alert error">{{ libError }}</div>
+          <div class="lib-manage-list">
+            <div v-for="lib in libraries" :key="lib.id || 'default'" class="lib-manage-row">
+              <template v-if="lib.default">
+                <span class="lib-manage-name">{{ lib.name }}</span>
+                <span class="lib-count">{{ lib.doc_count }}</span>
+                <span class="lib-manage-fixed">固定</span>
+              </template>
+              <template v-else>
+                <input v-model="libDrafts[lib.id]" class="lib-manage-input" />
+                <span class="lib-count">{{ lib.doc_count }}</span>
+                <button type="button" class="btn ghost small" @click="renameLib(lib)">保存</button>
+                <button type="button" class="btn ghost small danger" @click="removeLib(lib)">
+                  删除
+                </button>
+              </template>
             </div>
-            <p v-if="!categoryDrafts.length" class="empty">还没有分类，先添加一个吧。</p>
           </div>
         </div>
         <div class="modal-foot">
-          <button class="btn" @click="showCategories = false">关闭</button>
+          <button type="button" class="btn primary" @click="libManager = false">完成</button>
         </div>
       </div>
     </div>

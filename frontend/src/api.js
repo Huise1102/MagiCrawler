@@ -81,36 +81,41 @@ export function deleteDocument(id) {
   return request(`/api/documents/${id}`, { method: 'DELETE' })
 }
 
-export function autoClassifyDocuments() {
-  return request('/api/documents/auto-classify', {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({}),
-  })
+export function listLibraries() {
+  return request('/api/libraries')
 }
 
-export function listCategories() {
-  return request('/api/categories')
-}
-
-export function createCategory(name) {
-  return request('/api/categories', {
+export function createLibrary(name) {
+  return request('/api/libraries', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ name }),
   })
 }
 
-export function updateCategory(id, name) {
-  return request(`/api/categories/${id}`, {
+export function updateLibrary(id, name) {
+  return request(`/api/libraries/${id}`, {
     method: 'PUT',
     headers: JSON_HEADERS,
     body: JSON.stringify({ name }),
   })
 }
 
-export function deleteCategory(id) {
-  return request(`/api/categories/${id}`, { method: 'DELETE' })
+export function deleteLibrary(id) {
+  return request(`/api/libraries/${id}`, { method: 'DELETE' })
+}
+
+/** 把一次采集批次的全部文档移入指定子库。 */
+export function moveTaskLibrary(taskId, libraryId) {
+  return request(`/api/tasks/${taskId}/library`, {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ library_id: libraryId }),
+  })
+}
+
+export function deleteDocumentBatch(taskId) {
+  return request(`/api/document-batches/${taskId}`, { method: 'DELETE' })
 }
 
 export function listLogs(level = '', q = '', limit = 300) {
@@ -158,4 +163,40 @@ export function toggleSchedule(id, enabled) {
 
 export function runSchedule(id) {
   return request(`/api/schedules/${id}/run`, { method: 'POST' })
+}
+
+export function getSettings() {
+  return request('/api/settings')
+}
+
+export function saveTheme(theme) {
+  return request('/api/settings/theme', {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ theme }),
+  })
+}
+
+export function saveSettings(payload) {
+  return request('/api/settings', {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function listModels(payload) {
+  return request('/api/settings/models', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function testSettings(payload) {
+  return request('/api/settings/test', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
 }

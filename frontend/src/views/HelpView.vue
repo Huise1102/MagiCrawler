@@ -152,15 +152,11 @@ function toggle(id) {
 
 <template>
   <section class="page help-page">
-    <header class="page-head row">
-      <div>
-        <h1>帮助中心</h1>
-        <p class="sub">常见问题的排查思路与解决办法；先看这里，大多数问题能快速定位。</p>
-      </div>
+    <div class="page-toolbar">
       <div class="doc-actions">
         <input v-model="query" class="doc-search" placeholder="搜索问题关键词，例如 登录 / 部分完成 / 模型" />
       </div>
-    </header>
+    </div>
 
     <div class="help-notice">
       <span class="help-notice-icon">!</span>

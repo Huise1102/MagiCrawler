@@ -32,6 +32,8 @@ class LLMConfig:
     model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "deepseek-chat"))
     temperature: float = field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0")))
     max_tokens: int = field(default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS", "4096")))
+    # 单次 LLM 调用超时（秒），避免模型卡住导致任务无限等待
+    timeout_s: int = field(default_factory=lambda: int(os.getenv("LLM_TIMEOUT_S", "120")))
 
 
 @dataclass
@@ -41,6 +43,8 @@ class CrawlerConfig:
     # 决策循环防御
     max_steps: int = field(default_factory=lambda: int(os.getenv("MAX_STEPS", "30")))
     max_retries: int = field(default_factory=lambda: int(os.getenv("MAX_RETRIES", "2")))
+    # 单个任务最长运行时间（秒），超时后提前结束并落库，避免无限爬取
+    max_run_seconds: int = field(default_factory=lambda: int(os.getenv("MAX_RUN_SECONDS", "180")))
 
     # 浏览器
     timeout_ms: int = field(default_factory=lambda: int(os.getenv("TIMEOUT_MS", "30000")))

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -108,6 +109,36 @@ def schema_fields_to_text(fields: list[Field]) -> str:
     return "\n".join(lines)
 
 
+# 中文数量单位换算（1.7万 -> 17000、3.2亿 -> 320000000）
+_UNIT_FACTORS = {"万": 10_000, "亿": 100_000_000, "w": 10_000, "k": 1_000}
+_TIME_RE = re.compile(r"\d{1,2}:\d{2}(?::\d{2})?")
+_UNIT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(万|亿|w|W|k|K)\+?")
+
+
+def _to_number(value: Any) -> float:
+    """把网页上常见的数值写法转为数字。
+
+    支持：千分位（1,234）、中文单位（1.7万 / 3.2亿）、缩写（120w / 8k）、
+    时长（03:06 -> 186 秒、1:02:03 -> 3723 秒）。无法识别时抛出 ValueError。
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    s = str(value).strip().replace(",", "").replace("，", "").replace("+", "").replace("＋", "")
+    # 去掉货币符号与「元」，如 £51.77 / ¥129 / 199元
+    s = re.sub(r"[¥￥$€£]|元", "", s).strip()
+    if not s:
+        raise ValueError("empty")
+    if _TIME_RE.fullmatch(s):
+        seconds = 0
+        for part in s.split(":"):
+            seconds = seconds * 60 + int(part)
+        return float(seconds)
+    m = _UNIT_RE.fullmatch(s)
+    if m:
+        return float(m.group(1)) * _UNIT_FACTORS[m.group(2).lower()]
+    return float(s)
+
+
 def _coerce(value: Any, ftype: str) -> Any:
     """把单值尽力转换为目标类型；失败返回 None。"""
     if value is None:
@@ -120,13 +151,11 @@ def _coerce(value: Any, ftype: str) -> Any:
                 return None
             return s
         if ftype == "number":
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return float(value)
-            return float(str(value))
+            return _to_number(value)
         if ftype == "integer":
             if isinstance(value, bool):
                 return None
-            return int(float(str(value)))
+            return int(_to_number(value))
         if ftype == "boolean":
             if isinstance(value, bool):
                 return value

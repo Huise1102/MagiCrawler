@@ -83,11 +83,7 @@ onMounted(load)
 
 <template>
   <section class="page">
-    <header class="page-head row">
-      <div>
-        <h1>历史任务</h1>
-        <p class="sub">最近的采集任务与结果</p>
-      </div>
+    <div class="page-toolbar">
       <div class="filters">
         <select v-model="statusFilter" @change="load">
           <option value="">全部状态</option>
@@ -97,7 +93,7 @@ onMounted(load)
           {{ loading ? '加载中……' : '刷新' }}
         </button>
       </div>
-    </header>
+    </div>
 
     <div v-if="error" class="alert error">{{ error }}</div>
 

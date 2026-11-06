@@ -104,6 +104,16 @@ def _compute_next(schedule: Schedule, now: datetime) -> str:
     )
 
 
+def _reconcile_stale_tasks() -> None:
+    """启动时把上次进程遗留的 pending/running 任务标记为失败，避免“永远运行中”。"""
+    for status in (TASK_STATUS["PENDING"], TASK_STATUS["RUNNING"]):
+        for task in storage.list(status=status, limit=1000):
+            task.status = TASK_STATUS["FAILED"]
+            task.error = "服务重启导致任务中断，请重新发起"
+            storage.save(task)
+            logger.warning("已重置中断任务：%s", task.id[:8])
+
+
 def _init_schedule_times() -> None:
     """启动时校正下次运行时间：停机期间错过的任务不再补跑。"""
     now = datetime.now()
@@ -181,6 +191,7 @@ async def _scheduler_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _reconcile_stale_tasks()
     _init_schedule_times()
     scheduler_task = asyncio.create_task(_scheduler_loop())
     try:
@@ -258,9 +269,12 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
 
 def _status_from(result) -> str:
     n = len(result.items)
+    note = result.note or ""
+    if "超时" in note:
+        return TASK_STATUS["PARTIAL"] if n else TASK_STATUS["FAILED"]
     if n == 0:
         return TASK_STATUS["PARTIAL"]
-    if "少于" in result.note:
+    if "少于" in note:
         return TASK_STATUS["PARTIAL"]
     return TASK_STATUS["SUCCESS"]
 
@@ -336,7 +350,13 @@ async def visualize_task(task_id: str, body: VisualizeBody):
         raise HTTPException(status_code=400, detail="该任务没有可用于可视化的数据")
 
     visualizer = Visualizer(llm_client)
-    plan = await asyncio.to_thread(visualizer.plan, task.task_desc, items, body.hint)
+    try:
+        plan = await asyncio.to_thread(visualizer.plan, task.task_desc, items, body.hint)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail=f"LLM 服务不可用，请确认 Ollama（127.0.0.1:11434）已启动：{e}",
+        ) from e
     return plan
 
 
@@ -360,6 +380,34 @@ def export_task(task_id: str, fmt: str = "json"):
         media_type=media_types.get(fmt, "application/octet-stream"),
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/api/documents")
+def list_documents(limit_tasks: int = 50, limit_per_task: int = 50):
+    """聚合各任务采集到的条目，供文档库页面浏览。"""
+    docs = []
+    for task in storage.list(limit=limit_tasks):
+        if not task.result_json:
+            continue
+        try:
+            items = json.loads(task.result_json)
+        except json.JSONDecodeError:
+            continue
+        for idx, item in enumerate(items[:limit_per_task]):
+            if not isinstance(item, dict):
+                continue
+            docs.append(
+                {
+                    "id": f"{task.id}:{idx}",
+                    "task_id": task.id,
+                    "task_desc": task.task_desc,
+                    "start_url": task.start_url,
+                    "status": task.status,
+                    "created_at": task.created_at,
+                    "fields": item,
+                }
+            )
+    return {"items": docs, "total": len(docs)}
 
 
 # ---------------- 定时任务 CRUD ----------------

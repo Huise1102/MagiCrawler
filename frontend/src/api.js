@@ -33,6 +33,18 @@ export function getTask(id) {
   return request(`/api/tasks/${id}`)
 }
 
+export function generateSchema(payload) {
+  return request('/api/schema/generate', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteTask(id) {
+  return request(`/api/tasks/${id}`, { method: 'DELETE' })
+}
+
 export function exportUrl(id, fmt) {
   return `/api/tasks/${id}/export?fmt=${fmt}`
 }
@@ -47,6 +59,69 @@ export function visualizeTask(id, hint = '') {
 
 export function listDocuments() {
   return request('/api/documents')
+}
+
+export function createDocument(payload) {
+  return request('/api/documents', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function updateDocument(id, payload) {
+  return request(`/api/documents/${id}`, {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteDocument(id) {
+  return request(`/api/documents/${id}`, { method: 'DELETE' })
+}
+
+export function autoClassifyDocuments() {
+  return request('/api/documents/auto-classify', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  })
+}
+
+export function listCategories() {
+  return request('/api/categories')
+}
+
+export function createCategory(name) {
+  return request('/api/categories', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function updateCategory(id, name) {
+  return request(`/api/categories/${id}`, {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function deleteCategory(id) {
+  return request(`/api/categories/${id}`, { method: 'DELETE' })
+}
+
+export function listLogs(level = '', q = '', limit = 300) {
+  const qs = new URLSearchParams({ limit: String(limit) })
+  if (level) qs.set('level', level)
+  if (q) qs.set('q', q)
+  return request(`/api/logs?${qs.toString()}`)
+}
+
+export function clearLogs() {
+  return request('/api/logs', { method: 'DELETE' })
 }
 
 export function listSchedules() {

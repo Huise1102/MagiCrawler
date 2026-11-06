@@ -170,20 +170,30 @@ class BrowserTools:
     # ---------------- 页面快照 ----------------
 
     def snapshot(self, max_chars: int = 8000) -> str:
-        """生成精简可读快照：正文文本 + 关键链接 + 按钮文本。"""
+        """生成精简可读快照：正文文本 + 关键链接（含地址）+ 按钮文本。"""
         page = self.page
         text = page.evaluate(
             "() => document.body ? document.body.innerText || '' : ''"
         )
         text = (text or "").strip()
 
-        # 关键链接（去重、限量）
+        # 关键链接：保留「文本 -> 地址」，便于提取详情页 URL / 资源 ID
         links = page.evaluate(
-            """() => Array.from(document.querySelectorAll('a'))
-              .map(a => (a.innerText || '').trim())
-              .filter(t => t && t.length <= 60)
-              .filter((t, i, arr) => arr.indexOf(t) === i)
-              .slice(0, 80)"""
+            """() => {
+              const seen = new Set();
+              const out = [];
+              for (const a of document.querySelectorAll('a[href]')) {
+                const t = (a.innerText || '').trim();
+                const h = a.href || '';
+                if (!t || t.length > 60 || !h.startsWith('http')) continue;
+                const key = t + '|' + h;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push([t, h]);
+                if (out.length >= 40) break;
+              }
+              return out;
+            }"""
         )
         buttons = page.evaluate(
             """() => Array.from(document.querySelectorAll('button, [role=button], input[type=submit]'))
@@ -195,12 +205,19 @@ class BrowserTools:
 
         parts = []
         if text:
+            # 同一页面常重复渲染列表，保留前 max_chars 字符即可
             parts.append("【页面文本】\n" + text[:max_chars])
         if links:
-            parts.append("【链接文本】\n" + " | ".join(links))
+            # 去掉域名前缀，控制 token 消耗
+            rows = []
+            for label, href in links:
+                path = href.replace("https://", "").replace("http://", "")
+                path = path[:100]
+                rows.append(f"{label} -> {path}")
+            parts.append("【链接（文本 -> 地址）】\n" + "\n".join(rows))
         if buttons:
             parts.append("【按钮/可点击文本】\n" + " | ".join(buttons))
-        return "\n\n".join(parts)
+        return "\n\n".join(parts).strip()
 
     # ---------------- 工具动作 ----------------
 

@@ -45,6 +45,10 @@ export function visualizeTask(id, hint = '') {
   })
 }
 
+export function listDocuments() {
+  return request('/api/documents')
+}
+
 export function listSchedules() {
   return request('/api/schedules')
 }

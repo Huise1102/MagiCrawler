@@ -42,6 +42,8 @@ class Agent:
         self.llm = llm
         self.config = config
         self._llm_calls = 0
+        self._llm_errors = 0
+        self._deadline = 0.0
 
     # ---------------- 主入口 ----------------
 
@@ -59,6 +61,8 @@ class Agent:
         trajectory: list[dict] = []
         timings: dict[str, Any] = {}
         self._llm_calls = 0
+        self._llm_errors = 0
+        self._deadline = time.monotonic() + max(1, self.config.max_run_seconds)
         start = time.perf_counter()
         try:
             t0 = time.perf_counter()
@@ -93,6 +97,9 @@ class Agent:
         no_progress = 0
         last_snapshot = ""
 
+        if self._remaining() <= 1:
+            return RunResult(items=[], note=self._timeout_note([], task_desc), trajectory=trajectory)
+
         # 起始导航
         t0 = time.perf_counter()
         snapshot = tools.snapshot(self.config.max_snapshot_chars) if not start_url else tools.navigate(start_url)
@@ -100,6 +107,11 @@ class Agent:
         last_snapshot = snapshot
 
         for step in range(self.config.max_steps):
+            # 硬性截止：超过最长运行时间立即收尾，避免无限爬取
+            if self._remaining() <= 1:
+                note = self._timeout_note(collected, task_desc)
+                return RunResult(items=collected, note=note, trajectory=trajectory)
+
             user_msg = self._build_user_msg(snapshot, collected, trajectory)
             t_dec = time.perf_counter()
             action = self._decide(system_prompt, user_msg)
@@ -108,6 +120,14 @@ class Agent:
                 action = self._decide(system_prompt, user_msg + "\n（请严格只输出一个 JSON 动作对象）")
             dec_ms = _elapsed_ms(t_dec)
             timings["decision_ms"] = round(timings.get("decision_ms", 0) + dec_ms, 1)
+
+            if action is None:
+                # LLM 连续失败则终止，避免空转
+                if self._llm_errors >= 3:
+                    note = f"LLM 连续 {self._llm_errors} 次调用或解析失败，已终止。{self._build_note(collected, task_desc)}"
+                    return RunResult(items=collected, note=note, trajectory=trajectory)
+            else:
+                self._llm_errors = 0
 
             tool = (action or {}).get("tool", "")
             args = (action or {}).get("args", {}) or {}
@@ -193,11 +213,17 @@ class Agent:
         )
 
     def _decide(self, system_prompt: str, user_msg: str) -> dict | None:
+        if self._remaining() <= 1:
+            return None
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg + "\n\n" + ACTION_PROTOCOL},
         ]
-        raw = self.llm.chat(messages, temperature=0)
+        try:
+            raw = self.llm.chat(messages, temperature=0, timeout=self._remaining())
+        except Exception:  # noqa: BLE001
+            self._llm_errors += 1
+            return None
         self._llm_calls += 1
         data = self.llm.extract_json(raw)
         if isinstance(data, dict):
@@ -234,6 +260,8 @@ class Agent:
         要求输出紧凑单行 JSON 并限制条数：Qwen 等本地模型逐 token 生成，
         缩进与多余条目会成倍拉长耗时。
         """
+        if self._remaining() <= 1:
+            return []
         snapshot = tools.snapshot(self.config.max_snapshot_chars)
         names = ", ".join(f.name for f in fields)
         limit = f"最多 {remain} 条。" if remain else ""
@@ -247,12 +275,29 @@ class Agent:
             {"role": "system", "content": "你是网页数据提取助手，只输出 JSON。"},
             {"role": "user", "content": prompt},
         ]
-        raw = self.llm.chat(messages, temperature=0)
+        try:
+            raw = self.llm.chat(messages, temperature=0, timeout=self._remaining())
+        except Exception:  # noqa: BLE001
+            self._llm_errors += 1
+            return []
         self._llm_calls += 1
         data = self.llm.extract_json(raw)
         if isinstance(data, dict) and isinstance(data.get("items"), list):
             return validate_items(data["items"], fields)
         return []
+
+    # ---------------- 时间预算 ----------------
+
+    def _remaining(self) -> float:
+        """距离本次任务截止还剩多少秒。"""
+        return self._deadline - time.monotonic()
+
+    def _timeout_note(self, collected: list, task_desc: str) -> str:
+        """超时收尾时的说明。"""
+        return (
+            f"执行超时：超过 {self.config.max_run_seconds} 秒，已提前终止；"
+            f"本次采集到 {len(collected)} 条数据。"
+        )
 
     @staticmethod
     def _merge(collected: list[dict], new_items: list[dict]) -> list[dict]:

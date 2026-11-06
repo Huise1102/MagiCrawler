@@ -2962,7 +2962,7 @@ a.btn:hover {
   margin-top: 18px;
 }
 
-@media (max-width: 1080px) {
+@media (max-width: 960px) {
   .hero {
     grid-template-columns: 1fr;
     gap: 26px;
@@ -2974,6 +2974,156 @@ a.btn:hover {
 
   .intro-features {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* 桌面端首页一屏展示：不加纵向滚动，卡片自适应压缩 */
+@media (min-width: 961px) and (min-height: 720px) {
+  .main:has(.intro-page) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px 24px 18px;
+    height: calc(100vh - 62px);
+    overflow: hidden;
+  }
+
+  .intro-page {
+    width: 100%;
+    height: 100%;
+    max-height: 900px;
+    padding-top: 0;
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) auto auto;
+    gap: 16px;
+  }
+
+  .hero {
+    height: 100%;
+    min-height: 0;
+    padding: 0;
+    gap: 36px;
+  }
+
+  .hero h1 {
+    margin-top: 16px;
+    font-size: clamp(28px, 2.8vw, 40px);
+  }
+
+  .hero-sub {
+    margin-top: 12px;
+    font-size: 14.5px;
+    line-height: 1.72;
+  }
+
+  .hero-actions {
+    margin-top: 18px;
+  }
+
+  .hero-tags {
+    margin-top: 18px;
+  }
+
+  .hero-carousel {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 16px 20px 12px;
+  }
+
+  .carousel-stage {
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 0;
+  }
+
+  .hero-slide {
+    justify-content: center;
+    min-height: 0;
+  }
+
+  .hero-slide h2 {
+    margin-top: 8px;
+    font-size: 20.5px;
+  }
+
+  .hero-slide p {
+    font-size: 13px;
+    line-height: 1.65;
+  }
+
+  .slide-points {
+    margin-top: 9px;
+  }
+
+  .slide-visual {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: 240px;
+    margin-top: 16px;
+    overflow: hidden;
+  }
+
+  .intro-features {
+    gap: 14px;
+    margin-top: 0;
+  }
+
+  .feature-card {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    column-gap: 12px;
+    padding: 15px 17px;
+  }
+
+  .feature-icon {
+    grid-row: 1 / span 2;
+    width: 32px;
+    height: 32px;
+    border-radius: 9px;
+    font-size: 11.5px;
+  }
+
+  .feature-card h3 {
+    grid-column: 2;
+    margin: 1px 0 4px;
+    font-size: 14.5px;
+  }
+
+  .feature-card p {
+    grid-column: 2;
+    font-size: 12.3px;
+    line-height: 1.58;
+  }
+
+  .intro-cta {
+    margin-top: 0;
+    padding: 17px 24px;
+    gap: 16px;
+  }
+
+  .intro-cta h2 {
+    font-size: 19px;
+  }
+
+  .intro-cta p {
+    margin-top: 4px;
+    font-size: 13px;
+  }
+}
+
+/* 中等宽度下特性卡改为两列，避免四列文字被挤成多行 */
+@media (min-width: 961px) and (max-width: 1180px) {
+  .intro-features {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* 视口较矮时隐藏轮播内的示意窗口，保证文字不被挤压 */
+@media (min-width: 961px) and (max-height: 750px) {
+  .slide-visual {
+    display: none;
   }
 }
 

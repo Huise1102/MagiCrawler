@@ -38,12 +38,14 @@ class RunResult:
 class Agent:
     """LLM 驱动的网页采集智能体。"""
 
-    def __init__(self, llm: LLMClient, config: CrawlerConfig):
+    def __init__(self, llm: LLMClient, config: CrawlerConfig, on_step=None):
         self.llm = llm
         self.config = config
         self._llm_calls = 0
         self._llm_errors = 0
         self._deadline = 0.0
+        # 每一步完成后回调（供后端实时推送采集链路）
+        self._on_step = on_step
 
     # ---------------- 主入口 ----------------
 
@@ -68,6 +70,17 @@ class Agent:
             t0 = time.perf_counter()
             tools.start()
             timings["browser_ms"] = _elapsed_ms(t0)
+            self._emit(
+                {
+                    "step": 0,
+                    "tool": "launch",
+                    "args": {"url": start_url},
+                    "time": time.strftime("%H:%M:%S"),
+                    "llm_ms": 0.0,
+                    "exec_ms": timings["browser_ms"],
+                    "total_ms": timings["browser_ms"],
+                }
+            )
             result = self._loop(tools, fields, task_desc, start_url, trajectory, timings)
         finally:
             tools.close()
@@ -104,6 +117,17 @@ class Agent:
         t0 = time.perf_counter()
         snapshot = tools.snapshot(self.config.max_snapshot_chars) if not start_url else tools.navigate(start_url)
         timings["navigate_ms"] = _elapsed_ms(t0)
+        self._emit(
+            {
+                "step": 0,
+                "tool": "navigate",
+                "args": {"url": start_url},
+                "time": time.strftime("%H:%M:%S"),
+                "llm_ms": 0.0,
+                "exec_ms": timings["navigate_ms"],
+                "total_ms": timings["navigate_ms"],
+            }
+        )
         last_snapshot = snapshot
 
         for step in range(self.config.max_steps):
@@ -112,7 +136,7 @@ class Agent:
                 note = self._timeout_note(collected, task_desc)
                 return RunResult(items=collected, note=note, trajectory=trajectory)
 
-            user_msg = self._build_user_msg(snapshot, collected, trajectory)
+            user_msg = self._build_user_msg(snapshot, collected, trajectory, target)
             t_dec = time.perf_counter()
             action = self._decide(system_prompt, user_msg)
             if action is None:
@@ -143,7 +167,7 @@ class Agent:
                 note = data.get("_note", "") if isinstance(data, dict) else ""
                 if not note:
                     note = self._build_note(collected, task_desc)
-                self._log_step(trajectory, step, tool, args, dec_ms, 0.0)
+                self._log_step(trajectory, step, tool, args, dec_ms, 0.0, len(collected))
                 return RunResult(items=collected, note=note, trajectory=trajectory)
 
             # 2) 提取候选
@@ -152,11 +176,11 @@ class Agent:
                 candidates = self._extract(tools, fields, remain)
                 exec_ms = _elapsed_ms(t_exec)
                 timings["extract_ms"] = round(timings.get("extract_ms", 0) + exec_ms, 1)
-                self._log_step(trajectory, step, tool, args, dec_ms, exec_ms)
                 before = len(collected)
                 collected = self._merge(collected, candidates)
                 if target:
                     collected = collected[:target]
+                self._log_step(trajectory, step, tool, args, dec_ms, exec_ms, len(collected))
                 # 已达到目标数量，直接结束，避免多余请求
                 if target and len(collected) >= target:
                     note = self._build_note(collected, task_desc)
@@ -193,27 +217,39 @@ class Agent:
 
     # ---------------- 子步骤 ----------------
 
-    @staticmethod
     def _log_step(
+        self,
         trajectory: list,
         step: int,
         tool: str,
         args: dict,
         dec_ms: float,
         exec_ms: float,
+        items: int | None = None,
     ) -> None:
-        """记录单步动作与耗时（决策 / 执行 / 合计）。"""
-        trajectory.append(
-            {
-                "step": step + 1,
-                "tool": tool,
-                "args": args,
-                "time": time.strftime("%H:%M:%S"),
-                "llm_ms": dec_ms,
-                "exec_ms": exec_ms,
-                "total_ms": round(dec_ms + exec_ms, 1),
-            }
-        )
+        """记录单步动作与耗时（决策 / 执行 / 合计），并通知链路回调。"""
+        entry = {
+            "step": step + 1,
+            "tool": tool,
+            "args": args,
+            "time": time.strftime("%H:%M:%S"),
+            "llm_ms": dec_ms,
+            "exec_ms": exec_ms,
+            "total_ms": round(dec_ms + exec_ms, 1),
+        }
+        if items is not None:
+            entry["items"] = int(items)
+        trajectory.append(entry)
+        self._emit(entry)
+
+    def _emit(self, entry: dict) -> None:
+        """把单步事件交给调用方（后端），回调异常不影响采集。"""
+        if not self._on_step:
+            return
+        try:
+            self._on_step(dict(entry))
+        except Exception:  # noqa: BLE001 - 回调仅用于展示，不能中断采集
+            pass
 
     def _decide(self, system_prompt: str, user_msg: str) -> dict | None:
         if self._remaining() <= 1:
@@ -233,12 +269,21 @@ class Agent:
             return data
         return None
 
-    def _build_user_msg(self, snapshot: str, collected: list, trajectory: list) -> str:
+    def _build_user_msg(
+        self, snapshot: str, collected: list, trajectory: list, target: int | None = None
+    ) -> str:
         recent = trajectory[-5:]
         hist = "\n".join([f"- {t['tool']}({json.dumps(t['args'], ensure_ascii=False)})" for t in recent]) or "（无）"
+        if target:
+            goal = (
+                f"目标数量：{target} 条；已收集 {len(collected)} 条，"
+                f"还需 {max(0, target - len(collected))} 条。达到目标数量立即 finish，不要多采。\n"
+            )
+        else:
+            goal = f"已收集条目数：{len(collected)}\n"
         return (
             f"当前页面快照：\n{snapshot[: self.config.max_snapshot_chars]}\n\n"
-            f"已收集条目数：{len(collected)}\n"
+            f"{goal}"
             f"最近动作：\n{hist}\n\n"
             "请决定下一步动作。"
         )
@@ -273,7 +318,11 @@ class Agent:
         prompt = (
             f"从页面中提取满足条件的条目，{limit}"
             '只输出紧凑 JSON（单行、无缩进、无多余空白），格式 {"items":[{...}]}。'
-            f"每个对象只包含这些字段：{names}。缺失字段设为 null，不要编造，不要任何说明文字。\n\n"
+            f"每个对象只包含这些字段：{names}。缺失字段设为 null，不要编造，不要任何说明文字。\n"
+            "页面中的时长（如 03:06）、播放量/点赞数（如 1.7万）等按原文照抄，"
+            "不要自行换算或因为格式特殊而丢弃；只有页面上确实找不到对应信息时才填 null。\n"
+            "链接/ID 必须是该条目自身的地址：不要把导航、频道、首页等公共链接当成条目链接，"
+            "找不到条目独立链接或 ID 时填 null，不要猜测或编造。\n\n"
             f"页面内容：\n{snapshot}"
         )
         messages = [
@@ -317,17 +366,41 @@ class Agent:
         return collected
 
     @staticmethod
-    def _target_count(task_desc: str) -> int | None:
-        """从目标描述里粗略提取期望数量（如"前 10 本"、"前 20 台"）。"""
+    def _cn_number(text: str) -> int | None:
+        """中文数字转整数（支持「五」「十五」「二十五」「一百二十」）。"""
+        digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+                  "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        units = {"十": 10, "百": 100, "千": 1000}
+        total = 0
+        current = 0
+        seen = False
+        for ch in text:
+            if ch in digits:
+                current = digits[ch]
+                seen = True
+            elif ch in units:
+                total += (current or 1) * units[ch]
+                current = 0
+                seen = True
+            else:
+                return None
+        return total + current if seen else None
+
+    @classmethod
+    def _target_count(cls, task_desc: str) -> int | None:
+        """从目标描述里粗略提取期望数量（如"前 10 本"、"前五个视频"）。"""
         import re
 
         m = re.search(
-            r"(?:前|首个|top\s*)?(\d+)\s*"
+            r"(?:前|首个|top\s*)?([0-9]+|[零一二两三四五六七八九十百千]+)\s*"
             r"(?:本|条|个|项|台|款|件|册|篇|名|家|种|套|张|页|次|部|只|盒|瓶|箱)",
             task_desc or "",
             re.IGNORECASE,
         )
-        return int(m.group(1)) if m else None
+        if not m:
+            return None
+        raw = m.group(1)
+        return int(raw) if raw.isdigit() else cls._cn_number(raw)
 
     @classmethod
     def _build_note(cls, collected: list, task_desc: str) -> str:

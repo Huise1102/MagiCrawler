@@ -5,6 +5,7 @@
 
 from .config import CrawlerConfig, LLMConfig, load_config
 from .agent import Agent
+from .classifier import DocumentClassifier
 from .llm import LLMClient
 from .schema import validate_items, parse_schema
 from .models import Schedule, Task, TASK_STATUS
@@ -15,6 +16,7 @@ __all__ = [
     "LLMConfig",
     "load_config",
     "Agent",
+    "DocumentClassifier",
     "LLMClient",
     "validate_items",
     "parse_schema",

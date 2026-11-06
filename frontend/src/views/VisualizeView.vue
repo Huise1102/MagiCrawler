@@ -82,6 +82,33 @@ function cellText(value) {
   return value === null || value === undefined || value === '' ? '—' : String(value)
 }
 
+// 类别名过长时改用序号标签，完整内容放到 tooltip，避免坐标轴互相挤压
+const LONG_LABEL = 12
+const MAX_CATEGORIES = 12
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (c) => {
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }
+    return map[c]
+  })
+}
+
+function numberText(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return cellText(value)
+  return n.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+}
+
+function truncate(text, max = 10) {
+  const s = cellText(text)
+  return s.length > max ? `${s.slice(0, max)}…` : s
+}
+
+function tooltipHtml(fullName, value, seriesName = '') {
+  const head = `<div style="max-width:260px;white-space:normal;line-height:1.5">${escapeHtml(fullName)}</div>`
+  return seriesName ? `${head}${escapeHtml(seriesName)}：${numberText(value)}` : `${head}${numberText(value)}`
+}
+
 function groupValues(chart) {
   const groups = new Map()
   for (const item of items.value) {
@@ -106,7 +133,7 @@ function groupValues(chart) {
 
 function buildOption(chart) {
   const title = {
-    text: chart.title,
+    text: truncate(chart.title, 30),
     left: 'center',
     top: 6,
     textStyle: { fontSize: 14, fontWeight: 600, color: '#1f2937' },
@@ -129,17 +156,27 @@ function buildOption(chart) {
   const values = groupValues(chart)
 
   if (chart.type === 'pie') {
+    const fullNames = values.map((v) => v[0])
+    const needShort = fullNames.some((n) => n.length > LONG_LABEL)
     return {
       title,
-      tooltip: { trigger: 'item' },
-      legend: { type: 'scroll', bottom: 0 },
+      tooltip: {
+        trigger: 'item',
+        formatter: (p) => tooltipHtml(p.data.fullName || p.name, p.value),
+      },
+      legend: { type: 'scroll', bottom: 0, formatter: (name) => truncate(name, 12) },
       series: [
         {
           type: 'pie',
           radius: ['38%', '62%'],
           center: ['50%', '52%'],
-          data: values.map(([name, value]) => ({ name, value })),
-          label: { formatter: '{b}: {c}' },
+          data: values.map(([name, value]) => ({ name, value, fullName: name })),
+          label: {
+            formatter: (p) =>
+              needShort
+                ? `#${p.dataIndex + 1}: ${numberText(p.value)}`
+                : `${truncate(p.name, 8)}: ${numberText(p.value)}`,
+          },
         },
       ],
     }
@@ -149,24 +186,43 @@ function buildOption(chart) {
     values.sort((a, b) => b[1] - a[1])
   }
 
+  const fullNames = values.map((v) => v[0])
+  const needShort = values.length > MAX_CATEGORIES || fullNames.some((n) => n.length > LONG_LABEL)
+  const labels = needShort ? fullNames.map((_, i) => `#${i + 1}`) : fullNames
   const aggregate = chart.aggregate || (chart.y ? 'sum' : 'count')
+  const useZoom = values.length > MAX_CATEGORIES
   return {
     title,
-    tooltip: { trigger: 'axis' },
-    grid: { left: 56, right: 28, top: 56, bottom: values.length > 8 ? 70 : 48 },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: chart.type === 'line' ? 'line' : 'shadow' },
+      formatter: (params) => {
+        const p = Array.isArray(params) ? params[0] : params
+        if (!p) return ''
+        return tooltipHtml(fullNames[p.dataIndex] ?? p.name, p.value, p.seriesName)
+      },
+    },
+    grid: { left: 56, right: 28, top: 56, bottom: useZoom ? 64 : 48 },
     xAxis: {
       type: 'category',
-      data: values.map((v) => v[0]),
-      axisLabel: { interval: 0, rotate: values.length > 8 ? 32 : 0 },
+      data: labels,
+      axisLabel: { interval: 0, rotate: 0 },
     },
     yAxis: { type: 'value' },
+    dataZoom: useZoom
+      ? [{ type: 'inside' }, { type: 'slider', height: 12, bottom: 10 }]
+      : undefined,
     series: [
       {
         type: chart.type,
         name: chart.y ? `${chart.y}（${aggregate}）` : '数量',
         data: values.map((v) => v[1]),
         barMaxWidth: 40,
-        label: { show: values.length <= 12, position: 'top' },
+        label: {
+          show: values.length <= MAX_CATEGORIES,
+          position: 'top',
+          formatter: (p) => numberText(p.value),
+        },
       },
     ],
   }
@@ -276,7 +332,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-if="plan" class="chart-grid">
-        <div v-for="(chart, i) in plan.charts" :key="i" class="chart-card">
+        <div v-for="(chart, i) in plan.charts" :key="i" class="chart-card" :title="chart.title">
           <div class="chart-box" :ref="(el) => setChartEl(el, i)" />
           <p class="chart-reason">{{ chart.type }} · x={{ chart.x }}<template v-if="chart.y"> · y={{ chart.y }}</template> · {{ chart.aggregate }}</p>
         </div>

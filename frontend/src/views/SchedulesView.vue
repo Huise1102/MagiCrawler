@@ -200,18 +200,14 @@ onMounted(load)
 
 <template>
   <section class="page">
-    <header class="page-head row">
-      <div>
-        <h1>定时任务</h1>
-        <p class="sub">为每个网址配置采集需求与执行时间，用滑动开关控制是否自动爬取。</p>
-      </div>
+    <div class="page-toolbar">
       <div class="filters">
         <button class="btn ghost" :disabled="loading" @click="load">
           {{ loading ? '加载中……' : '刷新' }}
         </button>
         <button class="btn primary" @click="openCreate">新建定时任务</button>
       </div>
-    </header>
+    </div>
 
     <div v-if="error" class="alert error">{{ error }}</div>
     <div v-if="message" class="alert info">{{ message }}</div>

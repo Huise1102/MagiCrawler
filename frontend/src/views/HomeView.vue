@@ -189,15 +189,5 @@ onBeforeUnmount(stopAuto)
       </article>
     </section>
 
-    <section class="intro-cta">
-      <div>
-        <h2>准备好采集第一个页面了吗？</h2>
-        <p>本地模型开箱即用，也可以在设置中切换到任意 OpenAI 兼容服务。</p>
-      </div>
-      <div class="intro-cta-actions">
-        <RouterLink to="/crawl" class="btn primary">开始智能采集</RouterLink>
-        <RouterLink to="/settings" class="btn ghost">配置模型</RouterLink>
-      </div>
-    </section>
   </section>
 </template>

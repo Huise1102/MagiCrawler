@@ -21,11 +21,14 @@ import ConfirmDialog from './components/ConfirmDialog.vue'
 
         <nav class="nav-links">
           <RouterLink to="/" exact-active-class="active">首页</RouterLink>
+          <RouterLink to="/crawl" active-class="active">智能采集</RouterLink>
           <RouterLink to="/schedules" active-class="active">定时任务</RouterLink>
           <RouterLink to="/visualize" active-class="active">可视化</RouterLink>
           <RouterLink to="/documents" active-class="active">文档库</RouterLink>
-          <RouterLink to="/logs" active-class="active">系统日志</RouterLink>
           <RouterLink to="/history" active-class="active">历史任务</RouterLink>
+          <RouterLink to="/logs" active-class="active">系统日志</RouterLink>
+          <RouterLink to="/help" active-class="active">帮助</RouterLink>
+          <RouterLink to="/settings" active-class="active">设置</RouterLink>
         </nav>
       </div>
     </header>

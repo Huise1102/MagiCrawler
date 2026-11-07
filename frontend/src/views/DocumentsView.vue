@@ -42,7 +42,7 @@ function libraryName(id) {
   return libraries.value.find((l) => l.id === (id || ''))?.name || '默认库'
 }
 
-/** 按单次采集分组：task_id 相同的文档归为一个批次，手动文档单独一组。 */
+/** 按单次采集分组：task_id 相同的文档归为一个批次；已解除任务关联的按采集时间分组。 */
 const batches = computed(() => {
   const q = query.value.trim().toLowerCase()
   const groups = new Map()
@@ -53,7 +53,7 @@ const batches = computed(() => {
       const hay = `${doc.title || ''} ${doc.task_desc || ''} ${JSON.stringify(doc.fields || {})}`.toLowerCase()
       if (!hay.includes(q)) continue
     }
-    const key = doc.task_id || MANUAL
+    const key = doc.task_id || `${MANUAL}:${doc.created_at || ''}`
     let group = groups.get(key)
     if (!group) {
       group = {
@@ -450,7 +450,7 @@ onMounted(load)
     </div>
 
     <!-- 文档详情 -->
-    <div v-if="selected" class="modal-mask" @click.self="selected = null">
+    <div v-if="selected" class="modal-backdrop" @click.self="selected = null">
       <div class="modal narrow">
         <div class="modal-head">
           <h3 :title="selected.title">{{ selected.title }}</h3>
@@ -496,7 +496,7 @@ onMounted(load)
     </div>
 
     <!-- 新建 / 编辑文档 -->
-    <div v-if="editor" class="modal-mask" @click.self="editor = null">
+    <div v-if="editor" class="modal-backdrop" @click.self="editor = null">
       <div class="modal">
         <div class="modal-head">
           <h3>{{ editor.mode === 'create' ? '新建文档' : '编辑文档' }}</h3>
@@ -533,7 +533,7 @@ onMounted(load)
     </div>
 
     <!-- 子库管理 -->
-    <div v-if="libManager" class="modal-mask" @click.self="libManager = false">
+    <div v-if="libManager" class="modal-backdrop" @click.self="libManager = false">
       <div class="modal narrow">
         <div class="modal-head">
           <h3>子库管理</h3>

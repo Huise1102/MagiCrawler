@@ -44,7 +44,7 @@ from agent_crawler import (
     load_config,
 )
 from agent_crawler.exporter import export_result
-from agent_crawler.storage import Storage
+from agent_crawler.storage import Storage, normalize_fields
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -792,6 +792,8 @@ def get_task(task_id: str):
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     row = task.to_row()
+    items = _normalize_items(_load_items(task.result_json))
+    row["result_json"] = json.dumps(items, ensure_ascii=False)
     row["trajectory"] = _trajectories.get(task_id, [])
     row["chain"] = _chains.get(task_id, [])
     return row

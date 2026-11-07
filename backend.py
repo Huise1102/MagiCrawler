@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -159,6 +160,101 @@ def _save_settings(cfg: LLMConfig) -> None:
     data = _read_settings_file()
     data["llm"] = _settings_payload(cfg)
     _write_settings_file(data)
+
+
+_NOTIFY_EVENTS = ("success", "partial", "failed")
+_NOTIFY_DEFAULT = {
+    "enabled": False,
+    "webhook_url": "",
+    "events": list(_NOTIFY_EVENTS),
+}
+
+
+def _load_saved_notify() -> dict:
+    """读取推送配置；缺省或损坏时返回默认值。"""
+    raw = _read_settings_file().get("notify")
+    cfg = dict(_NOTIFY_DEFAULT)
+    cfg["events"] = list(_NOTIFY_EVENTS)
+    if isinstance(raw, dict):
+        cfg["enabled"] = bool(raw.get("enabled"))
+        url = raw.get("webhook_url")
+        cfg["webhook_url"] = url.strip() if isinstance(url, str) else ""
+        events = raw.get("events")
+        if isinstance(events, list):
+            picked = [e for e in events if e in _NOTIFY_EVENTS]
+            cfg["events"] = picked or list(_NOTIFY_EVENTS)
+    return cfg
+
+
+def _notify_payload(task: Task) -> dict:
+    """构造推送到 Webhook 的 JSON 消息体。"""
+    return {
+        "event": "task.finished",
+        "app": "智能体爬虫",
+        "status": task.status,
+        "task_id": task.id,
+        "task_desc": task.task_desc,
+        "start_url": task.start_url,
+        "item_count": len(_load_items(task.result_json)),
+        "error": task.error or "",
+        "note": task.note or "",
+        "schedule_id": task.schedule_id or "",
+        "site_id": task.site_id or "",
+        "created_at": task.created_at,
+        "finished_at": _now_str(),
+    }
+
+
+def _notify_task(task: Task) -> None:
+    """任务结束后按配置推送；失败仅记录日志，不影响采集结果。"""
+    cfg = _load_saved_notify()
+    if not cfg["enabled"] or not cfg["webhook_url"]:
+        return
+    if task.status not in cfg["events"]:
+        return
+    try:
+        resp = requests.post(cfg["webhook_url"], json=_notify_payload(task), timeout=8)
+        resp.raise_for_status()
+        logger.info("推送成功 %s：%s（HTTP %s）", task.id[:8], task.status, resp.status_code)
+    except Exception as exc:  # noqa: BLE001 - 推送失败不能影响任务
+        logger.warning("推送失败 %s：%s", task.id[:8], exc)
+
+
+_RETENTION_DEFAULT = {"enabled": False, "days": 90}
+
+
+def _load_saved_retention() -> dict:
+    """读取数据保留策略；默认关闭、保留 90 天。"""
+    raw = _read_settings_file().get("retention")
+    cfg = dict(_RETENTION_DEFAULT)
+    if isinstance(raw, dict):
+        cfg["enabled"] = bool(raw.get("enabled"))
+        try:
+            days = int(raw.get("days"))
+        except (TypeError, ValueError):
+            days = _RETENTION_DEFAULT["days"]
+        cfg["days"] = max(1, min(3650, days))
+    return cfg
+
+
+def _retention_cutoff(days: int) -> str:
+    return (datetime.now() - timedelta(days=max(1, days))).isoformat(timespec="seconds")
+
+
+def _run_retention_cleanup() -> None:
+    """启动时按保留策略清理过期采集（手动文档不受影响）。"""
+    cfg = _load_saved_retention()
+    if not cfg["enabled"]:
+        return
+    cutoff = _retention_cutoff(cfg["days"])
+    removed = storage.purge_expired(cutoff)
+    if removed["tasks"] or removed["documents"]:
+        logger.info(
+            "按保留策略清理：%s 个任务、%s 条文档（早于 %s）",
+            removed["tasks"],
+            removed["documents"],
+            cutoff,
+        )
 
 
 _app_llm_config = _load_saved_llm() or _app_llm_config
@@ -336,6 +432,7 @@ async def _scheduler_loop() -> None:
 async def lifespan(_: FastAPI):
     _reconcile_stale_tasks()
     _init_schedule_times()
+    _run_retention_cleanup()
     scheduler_task = asyncio.create_task(_scheduler_loop())
     logger.info("服务启动完成：后端 8000，定时调度已就绪")
     try:
@@ -415,6 +512,17 @@ class ThemeBody(BaseModel):
     theme: str
 
 
+class NotifyBody(BaseModel):
+    enabled: bool = False
+    webhook_url: str = ""
+    events: list[str] = []
+
+
+class RetentionBody(BaseModel):
+    enabled: bool = False
+    days: int = 90
+
+
 class ModelQueryBody(BaseModel):
     provider: str = "ollama"
     base_url: str
@@ -469,6 +577,8 @@ def get_settings():
     return {
         "llm": _settings_payload(_app_llm_config),
         "ui": {"theme": _ui_theme},
+        "notify": _load_saved_notify(),
+        "retention": _load_saved_retention(),
         "settings_file": str(_SETTINGS_FILE),
     }
 
@@ -497,6 +607,88 @@ def update_theme(body: ThemeBody):
     data["ui"] = {"theme": theme}
     _write_settings_file(data)
     return {"status": "saved", "theme": theme}
+
+
+@app.put("/api/settings/notify")
+def update_notify(body: NotifyBody):
+    """保存任务推送配置（Webhook 地址与触发状态）。"""
+    url = (body.webhook_url or "").strip()
+    if body.enabled and not url:
+        raise HTTPException(status_code=400, detail="启用推送前请填写 Webhook 地址")
+    if url and not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Webhook 地址需以 http:// 或 https:// 开头")
+
+    events = [e for e in (body.events or []) if e in _NOTIFY_EVENTS] or list(_NOTIFY_EVENTS)
+    payload = {"enabled": bool(body.enabled), "webhook_url": url, "events": events}
+    data = _read_settings_file()
+    data["notify"] = payload
+    _write_settings_file(data)
+    return {"status": "saved", "notify": payload}
+
+
+@app.post("/api/settings/notify/test")
+def test_notify(body: NotifyBody):
+    """向填写的 Webhook 发送一条测试消息。"""
+    url = (body.webhook_url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="请先填写 Webhook 地址")
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Webhook 地址需以 http:// 或 https:// 开头")
+
+    payload = {
+        "event": "test",
+        "app": "智能体爬虫",
+        "message": "这是一条推送连通性测试消息，收到即表示配置可用。",
+        "time": _now_str(),
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=8)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"推送失败：{exc}") from exc
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=400, detail=f"推送失败：HTTP {resp.status_code}")
+    return {
+        "ok": True,
+        "status_code": resp.status_code,
+        "message": f"测试消息已发送（HTTP {resp.status_code}）",
+    }
+
+
+@app.get("/api/settings/retention/stats")
+def retention_stats():
+    """按已保存的保留策略统计可清理的任务与文档数量。"""
+    cfg = _load_saved_retention()
+    cutoff = _retention_cutoff(cfg["days"])
+    counts = storage.count_expired(cutoff)
+    return {"enabled": cfg["enabled"], "days": cfg["days"], "cutoff": cutoff, **counts}
+
+
+@app.put("/api/settings/retention")
+def update_retention(body: RetentionBody):
+    """保存数据保留策略。"""
+    days = max(1, min(3650, int(body.days or 0)))
+    payload = {"enabled": bool(body.enabled), "days": days}
+    data = _read_settings_file()
+    data["retention"] = payload
+    _write_settings_file(data)
+    cutoff = _retention_cutoff(days)
+    counts = storage.count_expired(cutoff)
+    return {"status": "saved", "retention": payload, "cutoff": cutoff, **counts}
+
+
+@app.post("/api/settings/retention/cleanup")
+def cleanup_retention():
+    """立即清理早于保留期限的已结束任务及其同步文档。"""
+    cfg = _load_saved_retention()
+    cutoff = _retention_cutoff(cfg["days"])
+    removed = storage.purge_expired(cutoff)
+    logger.info(
+        "手动清理完成：%s 个任务、%s 条文档（早于 %s）",
+        removed["tasks"],
+        removed["documents"],
+        cutoff,
+    )
+    return {"removed": removed, "cutoff": cutoff}
 
 
 @app.post("/api/settings/models")
@@ -657,6 +849,7 @@ async def _run_task(task_id: str) -> None:
             task.error = "绑定的网站记忆已被删除，请重新选择站点"
             storage.save(task)
             logger.warning("任务 %s 绑定的站点不存在", task_id[:8])
+            await asyncio.to_thread(_notify_task, task)
             return
         site_profile = str(_site_profile_dir(site.id))
         # 尚未登录过时目录可能不存在，提前创建（Playwright 需要目录已存在）
@@ -730,6 +923,7 @@ async def _run_task(task_id: str) -> None:
         task.error = str(e)
         logger.exception("任务失败 %s：%s", task_id[:8], e)
     storage.save(task)
+    await asyncio.to_thread(_notify_task, task)
 
 
 def _status_from(result) -> str:
@@ -800,6 +994,155 @@ def _normalize_items(items: list) -> list[dict]:
     return [normalize_fields(item) for item in items if isinstance(item, dict)]
 
 
+# 条目指纹优先使用的唯一标识字段（找不到时退回整条哈希）
+_KEY_FIELDS = (
+    "link", "url", "id", "sku", "asin", "isbn",
+    "title", "name", "标题", "名称", "书名", "姓名", "headline",
+)
+
+
+def _item_key(fields: dict) -> str:
+    """为条目生成用于对比的指纹。"""
+    for key in _KEY_FIELDS:
+        value = fields.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return f"{key}:{str(value).strip()}"
+    raw = json.dumps(fields, ensure_ascii=False, sort_keys=True)
+    return "raw:" + hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _item_label(fields: dict) -> str:
+    """取条目的展示名（标题优先）。"""
+    for key in _KEY_FIELDS:
+        value = fields.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()[:80]
+    for value in fields.values():
+        if isinstance(value, str) and value.strip() and not value.lower().startswith("http"):
+            return value.strip()[:80]
+    return "未命名条目"
+
+
+def _find_previous_task(task: Task) -> Optional[Task]:
+    """找同一网址（或同一站点）最近一次有结果的采集。"""
+    others = [
+        t
+        for t in storage.list(limit=500)
+        if t.id != task.id
+        and t.created_at < task.created_at
+        and t.status in (TASK_STATUS["SUCCESS"], TASK_STATUS["PARTIAL"])
+        and t.result_json
+    ]
+    for other in others:
+        if task.start_url and other.start_url == task.start_url:
+            return other
+    if task.site_id:
+        for other in others:
+            if other.site_id == task.site_id:
+                return other
+    return None
+
+
+@app.get("/api/tasks/{task_id}/diff")
+def task_diff(task_id: str):
+    """对比同一网址相邻两次采集结果：新增 / 消失 / 变更 / 不变。"""
+    task = storage.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    prev = _find_previous_task(task)
+    if prev is None:
+        return {
+            "comparable": False,
+            "reason": "没有找到同一网址（或同一站点）的上一次成功采集",
+            "previous": None,
+        }
+
+    cur_items = _normalize_items(_load_items(task.result_json))
+    prev_items = _normalize_items(_load_items(prev.result_json))
+    cur_map: dict[str, dict] = {}
+    for item in cur_items:
+        cur_map.setdefault(_item_key(item), item)
+    prev_map: dict[str, dict] = {}
+    for item in prev_items:
+        prev_map.setdefault(_item_key(item), item)
+
+    added = [v for k, v in cur_map.items() if k not in prev_map]
+    removed = [v for k, v in prev_map.items() if k not in cur_map]
+    changed: list[dict] = []
+    unchanged = 0
+    for key, item in cur_map.items():
+        before = prev_map.get(key)
+        if before is None:
+            continue
+        if before == item:
+            unchanged += 1
+            continue
+        changes = [
+            {"field": k, "before": before.get(k), "after": item.get(k)}
+            for k in item
+            if before.get(k) != item.get(k)
+        ]
+        changed.append({"label": _item_label(item), "changes": changes})
+
+    return {
+        "comparable": True,
+        "previous": {
+            "id": prev.id,
+            "task_desc": prev.task_desc,
+            "created_at": prev.created_at,
+            "item_count": len(prev_items),
+        },
+        "counts": {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": unchanged,
+        },
+        "added": [{"label": _item_label(x), "fields": x} for x in added[:20]],
+        "removed": [{"label": _item_label(x), "fields": x} for x in removed[:20]],
+        "changed": changed[:20],
+    }
+
+
+@app.get("/api/results/search")
+def search_results(q: str = "", limit: int = 30):
+    """跨历史任务检索结果条目（匹配任务描述与条目字段）。"""
+    keyword = (q or "").strip().lower()
+    if not keyword:
+        return {"items": [], "total": 0, "matched_items": 0}
+
+    limit = max(1, min(100, int(limit or 30)))
+    hits: list[dict] = []
+    matched_items = 0
+    for task in storage.list(limit=500):
+        items = _normalize_items(_load_items(task.result_json))
+        if not items:
+            continue
+        desc_hit = keyword in (task.task_desc or "").lower()
+        matched = []
+        for item in items:
+            if desc_hit or keyword in json.dumps(item, ensure_ascii=False).lower():
+                matched.append({"label": _item_label(item), "fields": item})
+        if not matched:
+            continue
+        matched_items += len(matched)
+        hits.append(
+            {
+                "task_id": task.id,
+                "task_desc": task.task_desc,
+                "status": task.status,
+                "created_at": task.created_at,
+                "item_count": len(items),
+                "matched": len(matched),
+                "samples": matched[:5],
+            }
+        )
+        if len(hits) >= limit:
+            break
+    return {"items": hits, "total": len(hits), "matched_items": matched_items}
+
+
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str):
     task = storage.get(task_id)
@@ -857,6 +1200,7 @@ async def visualize_task(task_id: str, body: VisualizeBody):
         items = json.loads(task.result_json) if task.result_json else []
     except ValueError:
         items = []
+    items = _normalize_items(items)
     if not items:
         raise HTTPException(status_code=400, detail="该任务没有可用于可视化的数据")
 
@@ -898,7 +1242,7 @@ def export_task(task_id: str, fmt: str = "json"):
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    items = json.loads(task.result_json) if task.result_json else []
+    items = _normalize_items(_load_items(task.result_json))
     filename, content = export_result(items, task.note, fmt)
     media_types = {
         "json": "application/json",
@@ -919,6 +1263,11 @@ def list_documents(limit: int = 500):
     """返回文档库内容（爬取结果首次访问时自动入库）。"""
     _sync_documents()
     docs = storage.list_documents(limit=limit)
+    for doc in docs:
+        title = str(doc.get("title") or "").strip()
+        # 旧数据里标题可能是序列化后的整条字段字符串，重新从字段推导
+        if title in ("", "未命名文档") or (title.startswith("{") and title.endswith("}")):
+            doc["title"] = _derive_title(doc.get("fields") or {})
     return {"items": docs, "total": len(docs)}
 
 
@@ -948,12 +1297,13 @@ def _sync_documents() -> None:
         for idx, item in enumerate(items[:100]):
             if not isinstance(item, dict):
                 continue
+            fields = normalize_fields(item)
             storage.insert_linked_document(
                 doc_id=f"{task.id}:{idx}",
                 task_id=task.id,
                 doc_index=idx,
-                title=_derive_title(item),
-                fields_json=json.dumps(item, ensure_ascii=False),
+                title=_derive_title(fields),
+                fields_json=json.dumps(fields, ensure_ascii=False),
                 created_at=task.created_at,
             )
         storage.mark_task_synced(task.id)

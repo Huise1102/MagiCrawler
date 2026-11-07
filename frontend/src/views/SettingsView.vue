@@ -1,6 +1,18 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { getSettings, listModels, saveSettings, saveTheme, testSettings } from '../api'
+import {
+  cleanupRetention,
+  getRetentionStats,
+  getSettings,
+  listModels,
+  saveNotify,
+  saveRetention,
+  saveSettings,
+  saveTheme,
+  testNotify,
+  testSettings,
+} from '../api'
+import { confirmDialog } from '../composables/useConfirm'
 import { applyTheme, getThemePreference } from '../theme'
 
 const THEME_OPTIONS = [
@@ -32,6 +44,30 @@ const PRESETS = [
 
 const themePref = ref(getThemePreference())
 const resolvedTheme = ref(document.documentElement.dataset.theme || 'light')
+
+const NOTIFY_EVENTS = [
+  { key: 'success', label: '采集成功' },
+  { key: 'partial', label: '部分完成' },
+  { key: 'failed', label: '采集失败' },
+]
+
+const notify = reactive({
+  enabled: false,
+  webhook_url: '',
+  events: ['success', 'partial', 'failed'],
+})
+const notifySaving = ref(false)
+const notifyTesting = ref(false)
+const notifyResult = ref(null)
+const notifyError = ref('')
+const savedNotify = ref(null)
+
+const retention = reactive({ enabled: false, days: 90 })
+const retentionStats = ref({ tasks: 0, documents: 0, cutoff: '' })
+const retentionSaving = ref(false)
+const retentionCleaning = ref(false)
+const retentionError = ref('')
+const retentionResult = ref(null)
 
 const form = reactive({
   provider: 'ollama',
@@ -184,6 +220,126 @@ async function save() {
   }
 }
 
+function notifyPayload() {
+  return {
+    enabled: notify.enabled,
+    webhook_url: notify.webhook_url.trim(),
+    events: [...notify.events],
+  }
+}
+
+function validateNotify() {
+  const url = notify.webhook_url.trim()
+  if (notify.enabled && !url) return '启用推送前请填写 Webhook 地址。'
+  if (url && !/^https?:\/\//.test(url)) return 'Webhook 地址需以 http:// 或 https:// 开头。'
+  if (!notify.events.length) return '请至少选择一个推送时机。'
+  return ''
+}
+
+async function saveNotifySettings() {
+  const message = validateNotify()
+  notifyError.value = message
+  notifyResult.value = null
+  if (message) return
+  notifySaving.value = true
+  try {
+    const res = await saveNotify(notifyPayload())
+    savedNotify.value = res.notify
+    Object.assign(notify, res.notify)
+    notifyResult.value = { message: res.notify.enabled ? '推送设置已保存并启用。' : '推送设置已保存（当前未启用）。' }
+  } catch (e) {
+    notifyError.value = e.message
+  } finally {
+    notifySaving.value = false
+  }
+}
+
+async function testNotifySettings() {
+  const message = validateNotify()
+  notifyError.value = message
+  notifyResult.value = null
+  if (message) return
+  notifyTesting.value = true
+  try {
+    notifyResult.value = await testNotify(notifyPayload())
+  } catch (e) {
+    notifyError.value = e.message
+  } finally {
+    notifyTesting.value = false
+  }
+}
+
+async function loadRetentionStats() {
+  try {
+    const res = await getRetentionStats()
+    retentionStats.value = {
+      tasks: res.tasks || 0,
+      documents: res.documents || 0,
+      cutoff: res.cutoff || '',
+    }
+  } catch (e) {
+    retentionError.value = e.message
+  }
+}
+
+function validateRetention() {
+  const days = Number(retention.days)
+  if (!Number.isFinite(days) || days < 1 || days > 3650) {
+    return '保留天数需在 1 到 3650 之间。'
+  }
+  return ''
+}
+
+async function saveRetentionSettings() {
+  const message = validateRetention()
+  retentionError.value = message
+  retentionResult.value = null
+  if (message) return
+  retentionSaving.value = true
+  try {
+    const res = await saveRetention({ enabled: retention.enabled, days: Number(retention.days) })
+    Object.assign(retention, res.retention)
+    retentionStats.value = {
+      tasks: res.tasks || 0,
+      documents: res.documents || 0,
+      cutoff: res.cutoff || '',
+    }
+    retentionResult.value = {
+      message: res.retention.enabled
+        ? `保留策略已保存：超过 ${res.retention.days} 天的采集数据将在下次启动时自动清理。`
+        : '保留策略已保存（当前未启用，不会自动清理）。',
+    }
+  } catch (e) {
+    retentionError.value = e.message
+  } finally {
+    retentionSaving.value = false
+  }
+}
+
+async function cleanupNow() {
+  const ok = await confirmDialog({
+    title: '立即清理过期数据',
+    message: `将删除早于 ${retentionStats.value.cutoff || '保留期限'} 的已结束任务及其同步文档，手动文档不受影响。此操作不可撤销。`,
+    confirmText: '清理',
+    danger: true,
+  })
+  if (!ok) return
+  retentionCleaning.value = true
+  retentionError.value = ''
+  retentionResult.value = null
+  try {
+    const res = await cleanupRetention()
+    retentionResult.value = {
+      message: `已清理 ${res.removed.tasks} 个任务、${res.removed.documents} 条文档。`,
+    }
+    await loadRetentionStats()
+  } catch (e) {
+    retentionError.value = e.message
+  } finally {
+    retentionCleaning.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     const res = await getSettings()
@@ -199,6 +355,23 @@ onMounted(async () => {
       timeout_s: res.llm.timeout_s ?? 120,
     })
     if (form.provider === 'ollama') loadModels(true)
+
+    if (res.notify) {
+      savedNotify.value = res.notify
+      Object.assign(notify, {
+        enabled: Boolean(res.notify.enabled),
+        webhook_url: res.notify.webhook_url || '',
+        events: Array.isArray(res.notify.events) ? res.notify.events : ['success', 'partial', 'failed'],
+      })
+    }
+
+    if (res.retention) {
+      Object.assign(retention, {
+        enabled: Boolean(res.retention.enabled),
+        days: Number(res.retention.days) || 90,
+      })
+    }
+    loadRetentionStats()
 
     const serverTheme = res.ui && res.ui.theme
     if (serverTheme && serverTheme !== themePref.value) {
@@ -382,6 +555,125 @@ onMounted(async () => {
       <p class="settings-note">
         当前实际使用：{{ resolvedTheme === 'dark' ? '深色' : '浅色' }}（<code>{{ themePref }}</code>）
       </p>
+    </section>
+
+    <section class="card settings-card">
+      <div class="settings-head">
+        <h2>任务推送</h2>
+        <p>任务结束时向 Webhook 发送 JSON 消息，可接入飞书/钉钉机器人、n8n 或其他自动化流程。</p>
+      </div>
+
+      <label class="notify-toggle">
+        <input v-model="notify.enabled" type="checkbox" />
+        <span>
+          <strong>启用推送</strong>
+          <small>{{ notify.enabled ? '任务结束后自动发送消息' : '当前不会发送任何消息' }}</small>
+        </span>
+      </label>
+
+      <label class="field">
+        <span>Webhook 地址</span>
+        <input
+          v-model="notify.webhook_url"
+          spellcheck="false"
+          placeholder="https://example.com/webhook"
+        />
+        <small>接收端需支持 POST JSON；消息包含任务描述、状态、条目数、错误信息与时间。</small>
+      </label>
+
+      <div class="notify-events">
+        <span class="preset-label">推送时机：</span>
+        <label
+          v-for="ev in NOTIFY_EVENTS"
+          :key="ev.key"
+          class="event-chip"
+          :class="{ active: notify.events.includes(ev.key) }"
+        >
+          <input v-model="notify.events" type="checkbox" :value="ev.key" />
+          {{ ev.label }}
+        </label>
+      </div>
+
+      <div v-if="notifyError" class="alert error">{{ notifyError }}</div>
+      <div v-if="notifyResult" class="settings-result ok">{{ notifyResult.message }}</div>
+
+      <div class="settings-actions">
+        <button
+          type="button"
+          class="btn ghost"
+          :disabled="notifyTesting || notifySaving"
+          @click="testNotifySettings"
+        >
+          {{ notifyTesting ? '发送中……' : '测试推送' }}
+        </button>
+        <button
+          type="button"
+          class="btn primary"
+          :disabled="notifySaving || notifyTesting"
+          @click="saveNotifySettings"
+        >
+          {{ notifySaving ? '保存中……' : '保存推送设置' }}
+        </button>
+      </div>
+
+      <p class="settings-note">
+        推送失败只记录到系统日志，不影响采集任务；定时任务使用同一份推送配置。
+        <span v-if="savedNotify && savedNotify.enabled">当前已启用。</span>
+      </p>
+    </section>
+
+    <section class="card settings-card">
+      <div class="settings-head">
+        <h2>数据保留</h2>
+        <p>超过保留期限的采集任务及其同步文档会在服务启动时自动清理，手动文档始终保留。</p>
+      </div>
+
+      <label class="notify-toggle">
+        <input v-model="retention.enabled" type="checkbox" />
+        <span>
+          <strong>启用自动清理</strong>
+          <small>
+            {{
+              retention.enabled
+                ? `每次启动清理超过 ${retention.days} 天的采集数据`
+                : '当前不会自动删除任何数据'
+            }}
+          </small>
+        </span>
+      </label>
+
+      <label class="field">
+        <span>保留天数</span>
+        <input v-model.number="retention.days" type="number" min="1" max="3650" step="1" />
+        <small>可设置 1 到 3650 天；仅清理已结束（成功 / 部分完成 / 失败）的采集。</small>
+      </label>
+
+      <p class="settings-note">
+        当前可清理：{{ retentionStats.tasks }} 个任务 · {{ retentionStats.documents }} 条文档
+        <span v-if="retentionStats.cutoff">（截止 {{ retentionStats.cutoff.replace('T', ' ') }}）</span>
+      </p>
+
+      <div v-if="retentionError" class="alert error">{{ retentionError }}</div>
+      <div v-if="retentionResult" class="settings-result ok">{{ retentionResult.message }}</div>
+
+      <div class="settings-actions">
+        <button
+          type="button"
+          class="btn ghost danger"
+          :disabled="retentionCleaning || retentionSaving"
+          @click="cleanupNow"
+        >
+          {{ retentionCleaning ? '清理中……' : '立即清理' }}
+        </button>
+        <button
+          type="button"
+          class="btn primary"
+          :disabled="retentionSaving || retentionCleaning"
+          @click="saveRetentionSettings"
+        >
+          {{ retentionSaving ? '保存中……' : '保存保留策略' }}
+        </button>
+      </div>
     </section>
   </section>
 </template>

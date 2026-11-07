@@ -48,6 +48,9 @@ class Task:
     status: str = TASK_STATUS["PENDING"]
     id: str = field(default_factory=_new_id)
     schedule_id: str = ""  # 由定时任务触发时记录来源
+    site_id: str = ""  # 绑定的网站记忆（复用登录态）
+    max_items: int = 0  # 最多采集条数，0 表示不限制
+    max_pages: int = 0  # 最多翻页数，0 表示不限制
     result_json: str = ""
     note: str = ""
     error: str = ""
@@ -72,6 +75,9 @@ def row_to_task(row: dict) -> Task:
         schema_json=row["schema_json"],
         status=row["status"],
         schedule_id=row.get("schedule_id") or "",
+        site_id=row.get("site_id") or "",
+        max_items=int(row.get("max_items") or 0),
+        max_pages=int(row.get("max_pages") or 0),
         result_json=row["result_json"] or "",
         note=row["note"] or "",
         error=row["error"] or "",
@@ -88,6 +94,9 @@ class Schedule:
     task_desc: str
     start_url: str
     schema_json: str
+    site_id: str = ""  # 绑定的网站记忆（复用登录态）
+    max_items: int = 0  # 最多采集条数，0 表示不限制
+    max_pages: int = 0  # 最多翻页数，0 表示不限制
     schedule_type: str = "interval"  # interval | daily
     interval_minutes: int = 60
     daily_times: list[str] = field(default_factory=lambda: ["09:00"])
@@ -128,6 +137,9 @@ def row_to_schedule(row: dict) -> Schedule:
         task_desc=row["task_desc"],
         start_url=row["start_url"],
         schema_json=row["schema_json"],
+        site_id=row.get("site_id") or "",
+        max_items=int(row.get("max_items") or 0),
+        max_pages=int(row.get("max_pages") or 0),
         schedule_type=row.get("schedule_type") or "interval",
         interval_minutes=int(row.get("interval_minutes") or 60),
         daily_times=[str(t) for t in daily_times],
@@ -137,6 +149,48 @@ def row_to_schedule(row: dict) -> Schedule:
         last_status=row.get("last_status") or "",
         last_task_id=row.get("last_task_id") or "",
         run_count=int(row.get("run_count") or 0),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+@dataclass
+class Site:
+    """网站记忆：长期采集的站点，保存域名、登录说明与登录态目录。"""
+
+    name: str
+    domain: str = ""
+    start_url: str = ""
+    login_note: str = ""
+    enabled: bool = True
+    id: str = field(default_factory=_new_id)
+    last_login_at: str = ""
+    last_used_at: str = ""
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+
+    def to_row(self) -> dict[str, Any]:
+        """转为 API / 前端使用的字典。"""
+        return asdict(self)
+
+    def to_db(self) -> dict[str, Any]:
+        """转为数据库行（布尔需编码）。"""
+        d = asdict(self)
+        d["enabled"] = 1 if self.enabled else 0
+        return d
+
+
+def row_to_site(row: dict) -> Site:
+    """从存储行恢复 Site。"""
+    return Site(
+        id=row["id"],
+        name=row["name"],
+        domain=row.get("domain") or "",
+        start_url=row.get("start_url") or "",
+        login_note=row.get("login_note") or "",
+        enabled=bool(row.get("enabled")),
+        last_login_at=row.get("last_login_at") or "",
+        last_used_at=row.get("last_used_at") or "",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

@@ -201,5 +201,16 @@ tests/                # 单元测试
 ## 测试
 
 ```bash
-python -m unittest discover -s tests
+python -m pytest tests -q
 ```
+
+## 致谢
+
+本项目的实现离不开以下开源项目与社区的支持：
+
+- [FastAPI](https://fastapi.tiangolo.com/)、[Starlette](https://www.starlette.io/)、[Uvicorn](https://www.uvicorn.org/)：后端接口与运行服务。
+- [Playwright](https://playwright.dev/)：浏览器自动化与页面观察能力。
+- [Vue 3](https://vuejs.org/)、[Vite](https://vitejs.dev/)、[Vue Router](https://router.vuejs.org/)、[ECharts](https://echarts.apache.org/)：前端界面、构建与可视化。
+- [SQLite](https://www.sqlite.org/)、[Pydantic](https://docs.pydantic.dev/)：数据持久化与接口校验。
+
+同时感谢所有提交 Issue、反馈建议与使用本项目的人，你们的真实场景让这个工具变得更好用。

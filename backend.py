@@ -9,14 +9,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -32,6 +37,7 @@ from agent_crawler import (
     LLMClient,
     LLMConfig,
     Schedule,
+    Site,
     Task,
     TASK_STATUS,
     Visualizer,
@@ -268,7 +274,7 @@ async def _run_schedule_task(schedule_id: str, task_id: str) -> None:
         return
 
     async with _schedule_lock:
-        await _run_task(task.id, task.task_desc, task.start_url, task.schema_json)
+        await _run_task(task.id)
 
         finished = storage.get(task.id)
         schedule.last_run_at = _now_str()
@@ -288,6 +294,9 @@ def _create_schedule_task(schedule: Schedule) -> Task:
         start_url=schedule.start_url,
         schema_json=schedule.schema_json,
         schedule_id=schedule.id,
+        site_id=schedule.site_id,
+        max_items=schedule.max_items,
+        max_pages=schedule.max_pages,
     )
     storage.save(task)
     return task
@@ -353,15 +362,29 @@ class TaskCreate(BaseModel):
     task_desc: str
     start_url: str
     schema_json: str
+    site_id: str = ""
+    max_items: int = 0
+    max_pages: int = 0
 
 
 class ScheduleBody(BaseModel):
     task_desc: str
     start_url: str
     schema_json: str
+    site_id: str = ""
+    max_items: int = 0
+    max_pages: int = 0
     schedule_type: str = "interval"
     interval_minutes: int = 60
     daily_times: list[str] = []
+    enabled: bool = True
+
+
+class SiteBody(BaseModel):
+    name: str
+    domain: str = ""
+    start_url: str = ""
+    login_note: str = ""
     enabled: bool = True
 
 
@@ -617,14 +640,31 @@ def _generate_schema(task_desc: str, start_url: str) -> dict:
 # ---------------- 任务执行 ----------------
 
 
-async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: str) -> None:
+async def _run_task(task_id: str) -> None:
     """在线程池中执行同步爬虫，并更新状态与耗时。"""
     task = storage.get(task_id)
     if task is None:
         return
     task.status = TASK_STATUS["RUNNING"]
     storage.save(task)
-    logger.info("任务开始 %s：%s（%s）", task_id[:8], task_desc, start_url)
+
+    # 绑定了网站记忆时，使用该站点的持久化 profile 复用登录态
+    site_profile = ""
+    if task.site_id:
+        site = storage.get_site(task.site_id)
+        if site is None:
+            task.status = TASK_STATUS["FAILED"]
+            task.error = "绑定的网站记忆已被删除，请重新选择站点"
+            storage.save(task)
+            logger.warning("任务 %s 绑定的站点不存在", task_id[:8])
+            return
+        site_profile = str(_site_profile_dir(site.id))
+        # 尚未登录过时目录可能不存在，提前创建（Playwright 需要目录已存在）
+        _site_profile_dir(site.id).mkdir(parents=True, exist_ok=True)
+        site.last_used_at = _now_str()
+        storage.save_site(site)
+
+    logger.info("任务开始 %s：%s（%s）", task_id[:8], task.task_desc, task.start_url)
 
     chain: list = []
     _chains[task_id] = chain
@@ -636,7 +676,15 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
 
     try:
         agent = Agent(llm_client, _app_crawler_config, on_step=_on_step)
-        result = await asyncio.to_thread(agent.run, task_desc, start_url, schema_json)
+        result = await asyncio.to_thread(
+            agent.run,
+            task.task_desc,
+            task.start_url,
+            task.schema_json,
+            site_profile or None,
+            task.max_items or None,
+            task.max_pages or None,
+        )
 
         task.result_json = json.dumps(result.items, ensure_ascii=False)
         task.note = result.note
@@ -645,8 +693,8 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
         task.status = _status_from(result)
         if not result.items:
             task.error = (
-                "未采集到任何数据：页面可能是空壳、需要登录或触发风控，"
-                "请检查起始网址，或在浏览器中登录后重试。"
+                "未采集到任何数据：页面可能是空壳、需要登录或触发风控。"
+                "可在「网站记忆」中为该站点保存登录态后重试。"
             )
 
         # 补一个收尾节点，让链路末端有明确终点（提前达标时爬虫不会记 finish）
@@ -687,10 +735,13 @@ async def _run_task(task_id: str, task_desc: str, start_url: str, schema_json: s
 def _status_from(result) -> str:
     n = len(result.items)
     note = result.note or ""
-    if "超时" in note:
-        return TASK_STATUS["PARTIAL"] if n else TASK_STATUS["FAILED"]
     if n == 0:
         return TASK_STATUS["FAILED"]
+    if "超时" in note:
+        return TASK_STATUS["PARTIAL"]
+    target = getattr(result, "target", None)
+    if target and n < target:
+        return TASK_STATUS["PARTIAL"]
     if "少于" in note:
         return TASK_STATUS["PARTIAL"]
     return TASK_STATUS["SUCCESS"]
@@ -703,14 +754,21 @@ def health():
 
 @app.post("/api/tasks")
 async def create_task(body: TaskCreate):
+    max_items, max_pages = _validate_limits(body.max_items, body.max_pages)
+    site_id = body.site_id.strip()
+    if site_id and storage.get_site(site_id) is None:
+        raise HTTPException(status_code=400, detail="选择的网站记忆不存在")
     task = Task(
         task_desc=body.task_desc.strip(),
         start_url=body.start_url.strip(),
         schema_json=body.schema_json.strip(),
+        site_id=site_id,
+        max_items=max_items,
+        max_pages=max_pages,
     )
     storage.save(task)
     logger.info("创建任务 %s：%s", task.id[:8], task.task_desc)
-    asyncio.create_task(_run_task(task.id, task.task_desc, task.start_url, task.schema_json))
+    asyncio.create_task(_run_task(task.id))
     return {"task_id": task.id, "status": task.status}
 
 
@@ -1125,6 +1183,163 @@ async def auto_classify_documents(body: Optional[AutoClassifyBody] = None):
     }
 
 
+# ---------------- 网站记忆 ----------------
+
+# 每个网站的浏览器登录态保存在 data/site_profiles/{site_id}
+_SITE_PROFILE_ROOT = Path(_app_crawler_config.db_path).resolve().parent / "site_profiles"
+_login_procs: dict[str, subprocess.Popen] = {}
+
+
+def _site_profile_dir(site_id: str) -> Path:
+    """返回网站登录态目录（持久化浏览器 profile）。"""
+    return _SITE_PROFILE_ROOT / site_id
+
+
+def _normalize_domain(value: str) -> str:
+    """把网址或域名统一成纯域名，便于展示与去重。"""
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    return (urlparse(raw).netloc or "").split(":")[0]
+
+
+def _validate_limits(max_items: int, max_pages: int) -> tuple[int, int]:
+    """校验采集数量约束，返回规范化后的值。"""
+    items = int(max_items or 0)
+    pages = int(max_pages or 0)
+    if items < 0 or items > 500:
+        raise HTTPException(status_code=400, detail="最多采集条数需在 0-500 之间")
+    if pages < 0 or pages > 50:
+        raise HTTPException(status_code=400, detail="最多翻页数需在 0-50 之间")
+    return items, pages
+
+
+def _read_login_stamp(site_id: str) -> str:
+    """读取登录助手写入的登录时间标记。"""
+    marker = _site_profile_dir(site_id) / "login.json"
+    if not marker.exists():
+        return ""
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        return str(data.get("logged_in_at") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _site_payload(site: Site) -> dict:
+    """补上登录状态与 profile 路径，供前端展示。"""
+    stamp = _read_login_stamp(site.id)
+    if stamp and stamp != site.last_login_at:
+        site.last_login_at = stamp
+        storage.save_site(site)
+    row = site.to_row()
+    row["logged_in_at"] = stamp or site.last_login_at
+    row["logged_in"] = bool(row["logged_in_at"])
+    row["profile_dir"] = str(_site_profile_dir(site.id))
+    return row
+
+
+def _find_site_by_name(name: str, exclude_id: str = "") -> Optional[Site]:
+    """按名称查找站点（用于唯一性校验）。"""
+    for site in storage.list_sites():
+        if site.name == name and site.id != exclude_id:
+            return site
+    return None
+
+
+@app.get("/api/sites")
+def list_sites():
+    return {"items": [_site_payload(s) for s in storage.list_sites()]}
+
+
+@app.post("/api/sites")
+def create_site(body: SiteBody):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请填写站点名称")
+    if len(name) > 40:
+        raise HTTPException(status_code=400, detail="站点名称最多 40 个字符")
+    if _find_site_by_name(name):
+        raise HTTPException(status_code=400, detail="站点名称已存在")
+    if not body.start_url.strip() and not body.domain.strip():
+        raise HTTPException(status_code=400, detail="请填写域名或起始网址")
+
+    site = Site(
+        name=name,
+        domain=_normalize_domain(body.domain or body.start_url),
+        start_url=body.start_url.strip(),
+        login_note=body.login_note.strip(),
+        enabled=body.enabled,
+    )
+    storage.save_site(site)
+    logger.info("新增网站记忆 %s：%s", site.id[:8], site.name)
+    return _site_payload(site)
+
+
+@app.put("/api/sites/{site_id}")
+def update_site(site_id: str, body: SiteBody):
+    site = storage.get_site(site_id)
+    if site is None:
+        raise HTTPException(status_code=404, detail="站点不存在")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请填写站点名称")
+    if len(name) > 40:
+        raise HTTPException(status_code=400, detail="站点名称最多 40 个字符")
+    if _find_site_by_name(name, exclude_id=site_id):
+        raise HTTPException(status_code=400, detail="站点名称已存在")
+
+    site.name = name
+    site.domain = _normalize_domain(body.domain or body.start_url)
+    site.start_url = body.start_url.strip()
+    site.login_note = body.login_note.strip()
+    site.enabled = body.enabled
+    storage.save_site(site)
+    return _site_payload(site)
+
+
+@app.delete("/api/sites/{site_id}")
+def delete_site(site_id: str):
+    site = storage.get_site(site_id)
+    if site is None:
+        raise HTTPException(status_code=404, detail="站点不存在")
+    storage.delete_site(site_id)
+    # 同时清理本地登录态，避免残留 Cookies
+    shutil.rmtree(_site_profile_dir(site_id), ignore_errors=True)
+    logger.info("删除网站记忆 %s：%s", site_id[:8], site.name)
+    return {"ok": True}
+
+
+@app.post("/api/sites/{site_id}/login")
+def open_site_login(site_id: str):
+    """打开有头浏览器让用户手动登录，关闭窗口后保存登录态。"""
+    site = storage.get_site(site_id)
+    if site is None:
+        raise HTTPException(status_code=404, detail="站点不存在")
+
+    proc = _login_procs.get(site_id)
+    if proc is not None and proc.poll() is None:
+        return {"message": "登录窗口已打开，请完成登录后关闭浏览器窗口。", "running": True}
+
+    profile = _site_profile_dir(site_id)
+    profile.mkdir(parents=True, exist_ok=True)
+    url = site.start_url or (f"https://{site.domain}" if site.domain else "")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        _login_procs[site_id] = subprocess.Popen(
+            [sys.executable, "-m", "agent_crawler.site_login", str(profile), url],
+            cwd=str(Path(__file__).resolve().parent),
+            creationflags=flags,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"无法打开登录窗口：{e}") from e
+
+    logger.info("打开登录窗口 %s：%s", site_id[:8], url or "(未填网址)")
+    return {"message": "登录窗口已打开，登录完成后关闭窗口即可自动保存。", "running": True}
+
+
 # ---------------- 定时任务 CRUD ----------------
 
 
@@ -1138,10 +1353,14 @@ def create_schedule(body: ScheduleBody):
     schedule_type, interval_minutes, daily_times = _validate_schedule_fields(
         body.schedule_type, body.interval_minutes, body.daily_times
     )
+    max_items, max_pages = _validate_limits(body.max_items, body.max_pages)
     schedule = Schedule(
         task_desc=body.task_desc.strip(),
         start_url=body.start_url.strip(),
         schema_json=body.schema_json.strip(),
+        site_id=body.site_id.strip(),
+        max_items=max_items,
+        max_pages=max_pages,
         schedule_type=schedule_type,
         interval_minutes=interval_minutes,
         daily_times=daily_times,
@@ -1162,9 +1381,13 @@ def update_schedule(schedule_id: str, body: ScheduleBody):
     schedule_type, interval_minutes, daily_times = _validate_schedule_fields(
         body.schedule_type, body.interval_minutes, body.daily_times
     )
+    max_items, max_pages = _validate_limits(body.max_items, body.max_pages)
     schedule.task_desc = body.task_desc.strip()
     schedule.start_url = body.start_url.strip()
     schedule.schema_json = body.schema_json.strip()
+    schedule.site_id = body.site_id.strip()
+    schedule.max_items = max_items
+    schedule.max_pages = max_pages
     schedule.schedule_type = schedule_type
     schedule.interval_minutes = interval_minutes
     schedule.daily_times = daily_times

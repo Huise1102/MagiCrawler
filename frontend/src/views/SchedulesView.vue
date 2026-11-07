@@ -4,6 +4,7 @@ import {
   createSchedule,
   deleteSchedule,
   listSchedules,
+  listSites,
   runSchedule,
   toggleSchedule,
   updateSchedule,
@@ -24,6 +25,7 @@ const DEFAULT_SCHEMA = JSON.stringify(
 )
 
 const schedules = ref([])
+const sites = ref([])
 const loading = ref(false)
 const error = ref('')
 const message = ref('')
@@ -35,6 +37,9 @@ const form = reactive({
   task_desc: '',
   start_url: '',
   schema_json: DEFAULT_SCHEMA,
+  site_id: '',
+  max_items: 0,
+  max_pages: 0,
   schedule_type: 'interval',
   interval_minutes: 60,
   daily_times_text: '09:00',
@@ -45,6 +50,9 @@ function resetForm() {
   form.task_desc = ''
   form.start_url = ''
   form.schema_json = DEFAULT_SCHEMA
+  form.site_id = ''
+  form.max_items = 0
+  form.max_pages = 0
   form.schedule_type = 'interval'
   form.interval_minutes = 60
   form.daily_times_text = '09:00'
@@ -64,6 +72,16 @@ async function load() {
   }
 }
 
+/** 读取可用的网站记忆（仅启用项）。 */
+async function loadSites() {
+  try {
+    const res = await listSites()
+    sites.value = (res.items || []).filter((s) => s.enabled)
+  } catch {
+    sites.value = []
+  }
+}
+
 function openCreate() {
   editingId.value = ''
   resetForm()
@@ -75,6 +93,9 @@ function openEdit(schedule) {
   form.task_desc = schedule.task_desc
   form.start_url = schedule.start_url
   form.schema_json = schedule.schema_json
+  form.site_id = schedule.site_id || ''
+  form.max_items = Number(schedule.max_items) || 0
+  form.max_pages = Number(schedule.max_pages) || 0
   form.schedule_type = schedule.schedule_type
   form.interval_minutes = schedule.interval_minutes
   form.daily_times_text = (schedule.daily_times || []).join(', ')
@@ -105,6 +126,9 @@ async function save() {
     task_desc: form.task_desc.trim(),
     start_url: form.start_url.trim(),
     schema_json: form.schema_json.trim(),
+    site_id: form.site_id,
+    max_items: Number(form.max_items) || 0,
+    max_pages: Number(form.max_pages) || 0,
     schedule_type: form.schedule_type,
     interval_minutes: Number(form.interval_minutes) || 1,
     daily_times:
@@ -195,7 +219,10 @@ function formatTime(value) {
   return value ? value.replace('T', ' ') : '—'
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadSites()
+})
 </script>
 
 <template>
@@ -290,6 +317,28 @@ onMounted(load)
             <label class="field">
               <span>起始网址</span>
               <input v-model="form.start_url" placeholder="https://example.com/books" />
+            </label>
+          </div>
+
+          <div class="grid-3">
+            <label class="field">
+              <span>网站记忆</span>
+              <select v-model="form.site_id">
+                <option value="">不使用（默认）</option>
+                <option v-for="s in sites" :key="s.id" :value="s.id">
+                  {{ s.name }} · {{ s.logged_in ? '已登录' : '未登录' }}
+                </option>
+              </select>
+            </label>
+            <label class="field">
+              <span>最多采集条数</span>
+              <input v-model.number="form.max_items" type="number" min="0" max="500" />
+              <small>0 表示不限制</small>
+            </label>
+            <label class="field">
+              <span>最多翻页</span>
+              <input v-model.number="form.max_pages" type="number" min="0" max="50" />
+              <small>0 表示不限制</small>
             </label>
           </div>
 

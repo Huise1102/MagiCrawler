@@ -200,3 +200,32 @@ export function testSettings(payload) {
     body: JSON.stringify(payload),
   })
 }
+
+export function listSites() {
+  return request('/api/sites')
+}
+
+export function createSite(payload) {
+  return request('/api/sites', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function updateSite(id, payload) {
+  return request(`/api/sites/${id}`, {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteSite(id) {
+  return request(`/api/sites/${id}`, { method: 'DELETE' })
+}
+
+/** 打开该站点的登录窗口（登录态保存在本地 profile）。 */
+export function loginSite(id) {
+  return request(`/api/sites/${id}/login`, { method: 'POST' })
+}

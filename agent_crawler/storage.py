@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sqlite3
 from typing import Any, Optional
 
-from .models import Schedule, Task, row_to_schedule, row_to_task
+from .models import Schedule, Site, Task, row_to_schedule, row_to_site, row_to_task
 
 _TASKS_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -75,16 +76,56 @@ CREATE TABLE IF NOT EXISTS libraries (
     name       TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sites (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    domain        TEXT NOT NULL DEFAULT '',
+    start_url     TEXT NOT NULL DEFAULT '',
+    login_note    TEXT NOT NULL DEFAULT '',
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    last_login_at TEXT NOT NULL DEFAULT '',
+    last_used_at  TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
 """
 
 # 旧库升级：字段名 -> 列定义
 _TASKS_COLUMNS = {
     "schedule_id": "TEXT NOT NULL DEFAULT ''",
     "timings_json": "TEXT NOT NULL DEFAULT ''",
+    "site_id": "TEXT NOT NULL DEFAULT ''",
+    "max_items": "INTEGER NOT NULL DEFAULT 0",
+    "max_pages": "INTEGER NOT NULL DEFAULT 0",
+}
+_SCHEDULES_COLUMNS = {
+    "site_id": "TEXT NOT NULL DEFAULT ''",
+    "max_items": "INTEGER NOT NULL DEFAULT 0",
+    "max_pages": "INTEGER NOT NULL DEFAULT 0",
 }
 _DOC_COLUMNS = {
     "library_id": "TEXT NOT NULL DEFAULT ''",
 }
+
+
+def normalize_fields(fields: Any) -> dict:
+    """展平历史遗留的 {"fields": "<dict 字符串>"} 结构。
+
+    旧版 Schema 生成器把字段列表包成 {"fields": [...]}，导致采集结果被存成
+    {"fields": "{'title': ...}"}，这里统一还原为真实字段字典。
+    """
+    if not isinstance(fields, dict):
+        return {}
+    inner = fields.get("fields")
+    if len(fields) == 1 and isinstance(inner, str):
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                parsed = loader(inner)
+            except (ValueError, TypeError, SyntaxError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return fields
 
 
 class Storage:
@@ -99,6 +140,7 @@ class Storage:
         self._conn.execute(_SCHEDULES_SQL)
         self._conn.executescript(_DOCS_SQL)
         self._ensure_columns("tasks", _TASKS_COLUMNS)
+        self._ensure_columns("schedules", _SCHEDULES_COLUMNS)
         self._ensure_columns("documents", _DOC_COLUMNS)
         self._conn.commit()
 
@@ -119,14 +161,18 @@ class Storage:
         self._conn.execute(
             """
             INSERT INTO tasks (id, task_desc, start_url, schema_json, status, schedule_id,
+                               site_id, max_items, max_pages,
                                result_json, note, error, timings_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 task_desc=excluded.task_desc,
                 start_url=excluded.start_url,
                 schema_json=excluded.schema_json,
                 status=excluded.status,
                 schedule_id=excluded.schedule_id,
+                site_id=excluded.site_id,
+                max_items=excluded.max_items,
+                max_pages=excluded.max_pages,
                 result_json=excluded.result_json,
                 note=excluded.note,
                 error=excluded.error,
@@ -140,6 +186,9 @@ class Storage:
                 task.schema_json,
                 task.status,
                 task.schedule_id,
+                task.site_id,
+                task.max_items,
+                task.max_pages,
                 task.result_json,
                 task.note,
                 task.error,
@@ -191,15 +240,19 @@ class Storage:
         row = schedule.to_db()
         self._conn.execute(
             """
-            INSERT INTO schedules (id, task_desc, start_url, schema_json, schedule_type,
+            INSERT INTO schedules (id, task_desc, start_url, schema_json, site_id,
+                                   max_items, max_pages, schedule_type,
                                    interval_minutes, daily_times, enabled, last_run_at,
                                    next_run_at, last_status, last_task_id, run_count,
                                    created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 task_desc=excluded.task_desc,
                 start_url=excluded.start_url,
                 schema_json=excluded.schema_json,
+                site_id=excluded.site_id,
+                max_items=excluded.max_items,
+                max_pages=excluded.max_pages,
                 schedule_type=excluded.schedule_type,
                 interval_minutes=excluded.interval_minutes,
                 daily_times=excluded.daily_times,
@@ -216,6 +269,9 @@ class Storage:
                 row["task_desc"],
                 row["start_url"],
                 row["schema_json"],
+                row["site_id"],
+                row["max_items"],
+                row["max_pages"],
                 row["schedule_type"],
                 row["interval_minutes"],
                 row["daily_times"],
@@ -245,6 +301,58 @@ class Storage:
 
     def delete_schedule(self, schedule_id: str) -> None:
         self._conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+        self._conn.commit()
+
+    # ---------------- 网站记忆 ----------------
+
+    def save_site(self, site: Site) -> None:
+        """插入或更新网站记忆。"""
+        from .models import _now
+
+        site.updated_at = _now()
+        row = site.to_db()
+        self._conn.execute(
+            """
+            INSERT INTO sites (id, name, domain, start_url, login_note, enabled,
+                               last_login_at, last_used_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                domain=excluded.domain,
+                start_url=excluded.start_url,
+                login_note=excluded.login_note,
+                enabled=excluded.enabled,
+                last_login_at=excluded.last_login_at,
+                last_used_at=excluded.last_used_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                row["id"],
+                row["name"],
+                row["domain"],
+                row["start_url"],
+                row["login_note"],
+                row["enabled"],
+                row["last_login_at"],
+                row["last_used_at"],
+                row["created_at"],
+                row["updated_at"],
+            ),
+        )
+        self._conn.commit()
+
+    def get_site(self, site_id: str) -> Optional[Site]:
+        row = self._conn.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
+        return row_to_site(dict(row)) if row else None
+
+    def list_sites(self) -> list[Site]:
+        rows = self._conn.execute(
+            "SELECT * FROM sites ORDER BY created_at DESC"
+        ).fetchall()
+        return [row_to_site(dict(r)) for r in rows]
+
+    def delete_site(self, site_id: str) -> None:
+        self._conn.execute("DELETE FROM sites WHERE id = ?", (site_id,))
         self._conn.commit()
 
     # ---------------- 分类 ----------------
@@ -492,7 +600,7 @@ class Storage:
             doc = dict(row)
             raw = doc.pop("fields_json", "") or "{}"
             try:
-                doc["fields"] = json.loads(raw)
+                doc["fields"] = normalize_fields(json.loads(raw))
             except json.JSONDecodeError:
                 doc["fields"] = {}
             doc["manual"] = not doc["task_id"]

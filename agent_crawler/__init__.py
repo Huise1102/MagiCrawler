@@ -8,7 +8,7 @@ from .agent import Agent
 from .classifier import DocumentClassifier
 from .llm import LLMClient
 from .schema import validate_items, parse_schema
-from .models import Schedule, Task, TASK_STATUS
+from .models import Schedule, Site, Task, TASK_STATUS
 from .visualizer import Visualizer
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "validate_items",
     "parse_schema",
     "Schedule",
+    "Site",
     "Task",
     "TASK_STATUS",
     "Visualizer",

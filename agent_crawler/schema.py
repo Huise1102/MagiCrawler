@@ -88,6 +88,22 @@ def parse_schema(schema_text: str) -> list[Field]:
             fields.append(Field(name=name, type=ftype, description=desc))
         return fields
 
+    # 兼容 {"fields": [{"name": ..., "type": ..., "desc": ...}]} 字段列表格式
+    raw_fields = data.get("fields")
+    if isinstance(raw_fields, list):
+        listed: list[Field] = []
+        for spec in raw_fields:
+            if not isinstance(spec, dict):
+                continue
+            name = str(spec.get("name") or "").strip()
+            if not name:
+                continue
+            ftype = _TYPE_ALIAS.get(str(spec.get("type") or "string").lower(), "string")
+            desc = str(spec.get("desc") or spec.get("description") or "")
+            listed.append(Field(name=name, type=ftype, description=desc))
+        if listed:
+            return listed
+
     # 兜底：把整个对象视为「字段名 -> 类型」的简单映射
     fields = []
     for name, t in data.items():

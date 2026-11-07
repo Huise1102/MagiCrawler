@@ -4,6 +4,7 @@ import CrawlView from './views/CrawlView.vue'
 import SchedulesView from './views/SchedulesView.vue'
 import VisualizeView from './views/VisualizeView.vue'
 import DocumentsView from './views/DocumentsView.vue'
+import SitesView from './views/SitesView.vue'
 import LogsView from './views/LogsView.vue'
 import HistoryView from './views/HistoryView.vue'
 import HelpView from './views/HelpView.vue'
@@ -15,6 +16,7 @@ const router = createRouter({
     { path: '/', name: 'home', component: HomeView },
     { path: '/crawl', name: 'crawl', component: CrawlView },
     { path: '/schedules', name: 'schedules', component: SchedulesView },
+    { path: '/sites', name: 'sites', component: SitesView },
     { path: '/visualize', name: 'visualize', component: VisualizeView },
     { path: '/documents', name: 'documents', component: DocumentsView },
     { path: '/logs', name: 'logs', component: LogsView },
@@ -30,6 +32,7 @@ router.afterEach((to) => {
     home: '首页',
     crawl: '智能采集',
     schedules: '定时任务',
+    sites: '网站记忆',
     visualize: '可视化',
     documents: '文档库',
     logs: '系统日志',

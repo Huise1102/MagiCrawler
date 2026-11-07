@@ -219,6 +219,37 @@ class Storage:
         self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         self._conn.commit()
 
+    def count_expired(self, cutoff: str) -> dict[str, int]:
+        """统计早于 cutoff、且已结束的任务与其文档数量（用于保留策略预览）。"""
+        where = "created_at < ? AND status NOT IN ('pending', 'running')"
+        tasks = self._conn.execute(
+            f"SELECT COUNT(*) AS c FROM tasks WHERE {where}", (cutoff,)
+        ).fetchone()["c"]
+        docs = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM documents WHERE task_id IN"
+            f" (SELECT id FROM tasks WHERE {where})",
+            (cutoff,),
+        ).fetchone()["c"]
+        return {"tasks": tasks, "documents": docs}
+
+    def purge_expired(self, cutoff: str) -> dict[str, int]:
+        """删除过期任务及其同步文档（手动文档不受影响）。"""
+        where = "created_at < ? AND status NOT IN ('pending', 'running')"
+        counts = self.count_expired(cutoff)
+        self._conn.execute(
+            "DELETE FROM documents WHERE task_id IN"
+            f" (SELECT id FROM tasks WHERE {where})",
+            (cutoff,),
+        )
+        self._conn.execute(
+            "DELETE FROM synced_tasks WHERE task_id IN"
+            f" (SELECT id FROM tasks WHERE {where})",
+            (cutoff,),
+        )
+        self._conn.execute(f"DELETE FROM tasks WHERE {where}", (cutoff,))
+        self._conn.commit()
+        return counts
+
     def detach_task_documents(self, task_id: str) -> None:
         """删除任务时保留其文档，解除文档与任务的关联。"""
         from .models import _now

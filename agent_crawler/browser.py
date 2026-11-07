@@ -45,6 +45,7 @@ class BrowserTools:
         block_resources: tuple[str, ...] = (),
         reuse: bool = False,
         idle_timeout_s: int = 300,
+        profile_dir: str | None = None,
     ):
         self.timeout_ms = timeout_ms
         self.user_agent = user_agent
@@ -53,6 +54,8 @@ class BrowserTools:
         self.block_resources = tuple(x.lower() for x in block_resources)
         self.reuse = reuse
         self.idle_timeout_s = idle_timeout_s
+        # 指定 profile 目录时使用持久化浏览器上下文，复用该站点的登录态
+        self.profile_dir = profile_dir
         self._pw = None
         self._browser = None
         self._context = None
@@ -77,6 +80,30 @@ class BrowserTools:
             "无法启动浏览器：未安装 Playwright Chromium，且系统 Edge/Chrome 均不可用。"
         ) from last_err
 
+    def _launch_persistent(self, profile_dir: str):
+        """启动持久化上下文（携带登录态）：与 _launch_browser 相同的回退顺序。"""
+        user_agent = (
+            self.user_agent
+            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+        last_err: Exception | None = None
+        for channel in (None, "msedge", "chrome"):
+            kwargs: dict[str, Any] = {
+                "headless": self.headless,
+                "user_agent": user_agent,
+                "viewport": {"width": 1280, "height": 800},
+            }
+            if channel:
+                kwargs["channel"] = channel
+            try:
+                return self._pw.chromium.launch_persistent_context(profile_dir, **kwargs)
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+        raise RuntimeError(
+            "无法启动浏览器：未安装 Playwright Chromium，且系统 Edge/Chrome 均不可用。"
+        ) from last_err
+
     def start(self) -> None:
         """启动（或复用）浏览器，并为本次任务创建独立 Context/Page。"""
         try:
@@ -85,6 +112,32 @@ class BrowserTools:
             raise RuntimeError(
                 "未安装 playwright。请先执行：pip install playwright 并 playwright install chromium"
             ) from e
+
+        if self.profile_dir:
+            # 网站记忆模式：用持久化上下文加载该站点的登录态（Cookie/本地存储）
+            self._pw = sync_playwright().start()
+            try:
+                self._context = self._launch_persistent(self.profile_dir)
+            except Exception as e:  # noqa: BLE001
+                self._pw.stop()
+                self._pw = None
+                raise RuntimeError(
+                    "无法加载网站记忆的登录态：请先关闭该站点的登录窗口后重试"
+                ) from e
+            self._context.set_default_timeout(self.timeout_ms)
+            if self.block_resources:
+                self._context.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in self.block_resources
+                    else route.continue_(),
+                )
+            self.page = (
+                self._context.pages[0]
+                if self._context.pages
+                else self._context.new_page()
+            )
+            return
 
         key = threading.get_ident()
         with _POOL_LOCK:
@@ -139,6 +192,11 @@ class BrowserTools:
             pass
         self._context = None
         self.page = None
+
+        if self.profile_dir:
+            # 持久化上下文关闭后直接释放 Playwright（不进入线程池）
+            self._shutdown_browser()
+            return
 
         if self.reuse:
             key = threading.get_ident()

@@ -1,30 +1,23 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import HomeView from './views/HomeView.vue'
-import CrawlView from './views/CrawlView.vue'
-import SchedulesView from './views/SchedulesView.vue'
-import VisualizeView from './views/VisualizeView.vue'
-import DocumentsView from './views/DocumentsView.vue'
-import SitesView from './views/SitesView.vue'
-import LogsView from './views/LogsView.vue'
-import HistoryView from './views/HistoryView.vue'
-import HelpView from './views/HelpView.vue'
-import SettingsView from './views/SettingsView.vue'
+
+// 路由按需加载：首屏只加载布局与首页，可视化页（含 echarts）等按需拉取
+const routes = [
+  { path: '/', name: 'home', component: () => import('./views/HomeView.vue') },
+  { path: '/crawl', name: 'crawl', component: () => import('./views/CrawlView.vue') },
+  { path: '/schedules', name: 'schedules', component: () => import('./views/SchedulesView.vue') },
+  { path: '/sites', name: 'sites', component: () => import('./views/SitesView.vue') },
+  { path: '/visualize', name: 'visualize', component: () => import('./views/VisualizeView.vue') },
+  { path: '/documents', name: 'documents', component: () => import('./views/DocumentsView.vue') },
+  { path: '/logs', name: 'logs', component: () => import('./views/LogsView.vue') },
+  { path: '/history', name: 'history', component: () => import('./views/HistoryView.vue') },
+  { path: '/help', name: 'help', component: () => import('./views/HelpView.vue') },
+  { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
+  { path: '/:pathMatch(.*)*', redirect: '/' },
+]
 
 const router = createRouter({
   history: createWebHistory(),
-  routes: [
-    { path: '/', name: 'home', component: HomeView },
-    { path: '/crawl', name: 'crawl', component: CrawlView },
-    { path: '/schedules', name: 'schedules', component: SchedulesView },
-    { path: '/sites', name: 'sites', component: SitesView },
-    { path: '/visualize', name: 'visualize', component: VisualizeView },
-    { path: '/documents', name: 'documents', component: DocumentsView },
-    { path: '/logs', name: 'logs', component: LogsView },
-    { path: '/history', name: 'history', component: HistoryView },
-    { path: '/help', name: 'help', component: HelpView },
-    { path: '/settings', name: 'settings', component: SettingsView },
-    { path: '/:pathMatch(.*)*', redirect: '/' },
-  ],
+  routes,
 })
 
 router.afterEach((to) => {

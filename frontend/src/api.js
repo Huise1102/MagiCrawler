@@ -33,6 +33,15 @@ export function getTask(id) {
   return request(`/api/tasks/${id}`)
 }
 
+export function getTaskDiff(id) {
+  return request(`/api/tasks/${id}/diff`)
+}
+
+export function searchResults(q, limit = 30) {
+  const qs = new URLSearchParams({ q, limit: String(limit) })
+  return request(`/api/results/search?${qs.toString()}`)
+}
+
 export function generateSchema(payload) {
   return request('/api/schema/generate', {
     method: 'POST',
@@ -175,6 +184,38 @@ export function saveTheme(theme) {
     headers: JSON_HEADERS,
     body: JSON.stringify({ theme }),
   })
+}
+
+export function saveNotify(payload) {
+  return request('/api/settings/notify', {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function testNotify(payload) {
+  return request('/api/settings/notify/test', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function saveRetention(payload) {
+  return request('/api/settings/retention', {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getRetentionStats() {
+  return request('/api/settings/retention/stats')
+}
+
+export function cleanupRetention() {
+  return request('/api/settings/retention/cleanup', { method: 'POST' })
 }
 
 export function saveSettings(payload) {

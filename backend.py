@@ -786,6 +786,20 @@ def list_tasks(status: Optional[str] = None, limit: int = 100):
     return {"items": items}
 
 
+def _load_items(raw: str) -> list:
+    """解析任务结果 JSON，异常时返回空列表。"""
+    try:
+        data = json.loads(raw or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _normalize_items(items: list) -> list[dict]:
+    """展平旧版 {"fields": "<dict 字符串>"} 条目，统一成真实字段字典。"""
+    return [normalize_fields(item) for item in items if isinstance(item, dict)]
+
+
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str):
     task = storage.get(task_id)

@@ -1,6 +1,6 @@
 <script setup>
-import { computed } from 'vue'
-import { exportUrl } from '../api'
+import { computed, onMounted, ref, watch } from 'vue'
+import { exportUrl, getTaskDiff } from '../api'
 import ResultTable from './ResultTable.vue'
 import StatusBadge from './StatusBadge.vue'
 
@@ -44,10 +44,19 @@ const schemaFields = computed(() => {
   try {
     const parsed = JSON.parse(schemaText.value)
     const propsObj = parsed.properties || (parsed.items && parsed.items.properties) || {}
-    return Object.entries(propsObj).map(([name, spec]) => ({
-      name,
-      desc: (spec && typeof spec === 'object' && spec.description) || '',
-    }))
+    if (Object.keys(propsObj).length) {
+      return Object.entries(propsObj).map(([name, spec]) => ({
+        name,
+        desc: (spec && typeof spec === 'object' && spec.description) || '',
+      }))
+    }
+    // 兼容旧版 {"fields": [{"name": ..., "desc": ...}]} 格式
+    if (Array.isArray(parsed.fields)) {
+      return parsed.fields
+        .filter((f) => f && f.name)
+        .map((f) => ({ name: f.name, desc: f.desc || f.description || '' }))
+    }
+    return []
   } catch {
     return []
   }
@@ -58,6 +67,37 @@ function formatMs(value) {
   if (!Number.isFinite(n) || n <= 0) return '—'
   return n >= 1000 ? `${(n / 1000).toFixed(2)} 秒` : `${Math.round(n)} 毫秒`
 }
+
+/** 与上一次采集的对比结果（同一网址/站点最近的完成记录）。 */
+const diff = ref(null)
+const diffLoading = ref(false)
+const diffError = ref('')
+
+async function loadDiff() {
+  diff.value = null
+  diffError.value = ''
+  if (running.value || !props.task.id) return
+  diffLoading.value = true
+  try {
+    diff.value = await getTaskDiff(props.task.id)
+  } catch (e) {
+    diffError.value = e.message
+  } finally {
+    diffLoading.value = false
+  }
+}
+
+function diffTime(value) {
+  return (value || '').replace('T', ' ').slice(0, 16)
+}
+
+function diffValue(value) {
+  if (value === null || value === undefined || value === '') return '—'
+  return typeof value === 'object' ? JSON.stringify(value) : String(value)
+}
+
+onMounted(loadDiff)
+watch(() => props.task.id, loadDiff)
 </script>
 
 <template>
@@ -140,6 +180,65 @@ function formatMs(value) {
       <span v-if="timings.action_ms" class="chip">页面动作 {{ formatMs(timings.action_ms) }}</span>
       <span v-if="timings.llm_calls" class="chip">LLM 调用 {{ timings.llm_calls }} 次</span>
       <span v-if="timings.steps" class="chip">{{ timings.steps }} 步</span>
+    </div>
+
+    <div v-if="!running" class="diff-block">
+      <div class="diff-head">
+        <h3>与上次对比</h3>
+        <span v-if="diff && diff.previous" class="diff-meta">
+          上次 {{ diffTime(diff.previous.created_at) }} · {{ diff.previous.item_count }} 条
+        </span>
+      </div>
+      <p v-if="diffLoading" class="diff-note"><span class="spinner" /> 正在对比……</p>
+      <p v-else-if="diffError" class="diff-note">{{ diffError }}</p>
+      <p v-else-if="diff && !diff.comparable" class="diff-note">{{ diff.reason }}</p>
+      <template v-else-if="diff">
+        <div class="diff-chips">
+          <span class="chip diff-add">新增 {{ diff.counts.added }}</span>
+          <span class="chip diff-remove">消失 {{ diff.counts.removed }}</span>
+          <span class="chip diff-change">变更 {{ diff.counts.changed }}</span>
+          <span class="chip">不变 {{ diff.counts.unchanged }}</span>
+        </div>
+        <div v-if="diff.counts.added || diff.counts.removed || diff.counts.changed" class="diff-cols">
+          <div v-if="diff.added.length" class="diff-col">
+            <h4>新增</h4>
+            <ul>
+              <li v-for="(x, i) in diff.added" :key="`a${i}`" :title="JSON.stringify(x.fields, null, 2)">
+                {{ x.label }}
+              </li>
+            </ul>
+            <p v-if="diff.counts.added > diff.added.length" class="diff-more">
+              还有 {{ diff.counts.added - diff.added.length }} 条
+            </p>
+          </div>
+          <div v-if="diff.removed.length" class="diff-col">
+            <h4>消失</h4>
+            <ul>
+              <li v-for="(x, i) in diff.removed" :key="`r${i}`" :title="JSON.stringify(x.fields, null, 2)">
+                {{ x.label }}
+              </li>
+            </ul>
+            <p v-if="diff.counts.removed > diff.removed.length" class="diff-more">
+              还有 {{ diff.counts.removed - diff.removed.length }} 条
+            </p>
+          </div>
+          <div v-if="diff.changed.length" class="diff-col">
+            <h4>变更</h4>
+            <ul>
+              <li v-for="(x, i) in diff.changed" :key="`c${i}`">
+                <span class="diff-name">{{ x.label }}</span>
+                <span v-for="(c, j) in x.changes" :key="`${i}-${j}`" class="diff-field">
+                  {{ c.field }}：{{ diffValue(c.before) }} → {{ diffValue(c.after) }}
+                </span>
+              </li>
+            </ul>
+            <p v-if="diff.counts.changed > diff.changed.length" class="diff-more">
+              还有 {{ diff.counts.changed - diff.changed.length }} 条
+            </p>
+          </div>
+        </div>
+        <p v-else class="diff-note">与上次相比没有差异。</p>
+      </template>
     </div>
 
     <ResultTable v-if="items.length" :items="items" />

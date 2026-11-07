@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { createTask, generateSchema, getTask } from '../api'
+import { createTask, generateSchema, getTask, listSites } from '../api'
 import AgentChain from '../components/AgentChain.vue'
 import ResultDetail from '../components/ResultDetail.vue'
 
@@ -8,7 +8,15 @@ const RUNNING = ['pending', 'running']
 const TASK_KEY = 'ac.home.task-id'
 const FORM_KEY = 'ac.home.form'
 
-const form = reactive({ task_desc: '', start_url: '', schema_json: '' })
+const form = reactive({
+  task_desc: '',
+  start_url: '',
+  schema_json: '',
+  site_id: '',
+  max_items: 0,
+  max_pages: 0,
+})
+const sites = ref([])
 const task = ref(null)
 const submitting = ref(false)
 const generating = ref(false)
@@ -77,6 +85,9 @@ function restoreForm() {
     form.task_desc = saved.task_desc || ''
     form.start_url = saved.start_url || ''
     form.schema_json = saved.schema_json || ''
+    form.site_id = saved.site_id || ''
+    form.max_items = Number(saved.max_items) || 0
+    form.max_pages = Number(saved.max_pages) || 0
     if (form.schema_json) {
       schemaEdited.value = true
       lastAutoDesc = form.task_desc
@@ -99,9 +110,20 @@ watch(
 onMounted(() => {
   restoreForm()
   formReady = true
+  loadSites()
   const saved = localStorage.getItem(TASK_KEY)
   if (saved) refresh(saved, true)
 })
+
+/** 只展示已启用的网站记忆。 */
+async function loadSites() {
+  try {
+    const res = await listSites()
+    sites.value = (res.items || []).filter((s) => s.enabled)
+  } catch {
+    sites.value = []
+  }
+}
 
 /** 让大模型根据目标描述识别意图并生成字段 Schema。 */
 async function runGenerate(auto = false) {
@@ -172,6 +194,9 @@ async function submit() {
       task_desc: form.task_desc.trim(),
       start_url: form.start_url.trim(),
       schema_json: form.schema_json.trim(),
+      site_id: form.site_id,
+      max_items: Number(form.max_items) || 0,
+      max_pages: Number(form.max_pages) || 0,
     })
     rememberTask(res.task_id)
     await refresh(res.task_id)
@@ -188,6 +213,9 @@ async function replay() {
   form.task_desc = task.value.task_desc || form.task_desc
   form.start_url = task.value.start_url || form.start_url
   form.schema_json = task.value.schema_json || form.schema_json
+  form.site_id = task.value.site_id || ''
+  form.max_items = Number(task.value.max_items) || 0
+  form.max_pages = Number(task.value.max_pages) || 0
   schemaEdited.value = true
   lastAutoDesc = form.task_desc
   schemaHint.value = ''
@@ -206,6 +234,9 @@ function startNewTask() {
   form.task_desc = ''
   form.start_url = ''
   form.schema_json = ''
+  form.site_id = ''
+  form.max_items = 0
+  form.max_pages = 0
   forgetTask()
   localStorage.removeItem(FORM_KEY)
 }
@@ -246,9 +277,47 @@ onBeforeUnmount(stopPolling)
           </label>
         </div>
 
+        <div class="grid-3">
+          <label class="field">
+            <span>网站记忆</span>
+            <select v-model="form.site_id" :disabled="busy">
+              <option value="">不使用（默认）</option>
+              <option v-for="s in sites" :key="s.id" :value="s.id">
+                {{ s.name }} · {{ s.logged_in ? '已登录' : '未登录' }}
+              </option>
+            </select>
+            <small v-if="!sites.length">暂无可用站点，可在「网站记忆」页面添加。</small>
+          </label>
+          <label class="field">
+            <span>最多采集条数</span>
+            <input
+              v-model.number="form.max_items"
+              type="number"
+              min="0"
+              max="500"
+              :disabled="busy"
+              placeholder="0 表示不限制"
+            />
+          </label>
+          <label class="field">
+            <span>最多翻页</span>
+            <input
+              v-model.number="form.max_pages"
+              type="number"
+              min="0"
+              max="50"
+              :disabled="busy"
+              placeholder="0 表示不限制"
+            />
+          </label>
+        </div>
+
         <div class="field schema-field">
           <span class="label-row">
             字段 Schema（JSON）
+            <small class="schema-hint">
+              {{ generating ? '正在识别字段……' : schemaHint || '可手动微调' }}
+            </small>
             <button
               type="button"
               class="btn ghost small"
@@ -266,10 +335,6 @@ onBeforeUnmount(stopPolling)
             placeholder="填写目标描述后，大模型会自动识别字段；也可点击右上角按钮手动生成"
             @input="onSchemaInput"
           />
-          <small v-if="generating">正在根据目标描述识别字段……</small>
-          <small v-else>
-            {{ schemaHint || '字段由大模型根据目标描述自动生成，可手动微调。' }}
-          </small>
         </div>
 
         <div v-if="error" class="alert error">{{ error }}</div>

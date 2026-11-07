@@ -1,6 +1,6 @@
 <script setup>
-import { onMounted, ref } from 'vue'
-import { deleteTask, getTask, listTasks } from '../api'
+import { onMounted, ref, watch } from 'vue'
+import { deleteTask, getTask, listTasks, searchResults } from '../api'
 import ResultDetail from '../components/ResultDetail.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { confirmDialog } from '../composables/useConfirm'
@@ -21,6 +21,47 @@ const deletingId = ref('')
 const detail = ref(null)
 const detailLoading = ref(false)
 const detailError = ref('')
+
+// 跨任务结果搜索
+const searchQuery = ref('')
+const searchHits = ref([])
+const searchMatched = ref(0)
+const searchLoading = ref(false)
+const searchError = ref('')
+let searchTimer = null
+
+async function runSearch() {
+  const keyword = searchQuery.value.trim()
+  if (!keyword) {
+    searchHits.value = []
+    searchMatched.value = 0
+    searchError.value = ''
+    return
+  }
+  searchLoading.value = true
+  searchError.value = ''
+  try {
+    const res = await searchResults(keyword)
+    if (searchQuery.value.trim() !== keyword) return
+    searchHits.value = res.items || []
+    searchMatched.value = res.matched_items || 0
+  } catch (e) {
+    searchError.value = e.message
+  } finally {
+    searchLoading.value = false
+  }
+}
+
+watch(searchQuery, () => {
+  clearTimeout(searchTimer)
+  if (!searchQuery.value.trim()) {
+    searchHits.value = []
+    searchMatched.value = 0
+    searchError.value = ''
+    return
+  }
+  searchTimer = setTimeout(runSearch, 400)
+})
 
 async function load() {
   loading.value = true
@@ -85,6 +126,11 @@ onMounted(load)
   <section class="page">
     <div class="page-toolbar">
       <div class="filters">
+        <input
+          v-model="searchQuery"
+          class="doc-search"
+          placeholder="搜索所有历史结果（标题、价格、描述…）"
+        />
         <select v-model="statusFilter" @change="load">
           <option value="">全部状态</option>
           <option v-for="s in STATUSES" :key="s.key" :value="s.key">{{ s.label }}</option>
@@ -96,6 +142,41 @@ onMounted(load)
     </div>
 
     <div v-if="error" class="alert error">{{ error }}</div>
+
+    <div v-if="searchQuery.trim()" class="card search-card">
+      <div class="search-head">
+        <h3>结果搜索</h3>
+        <span v-if="searchLoading" class="search-meta"><span class="spinner" /> 搜索中……</span>
+        <span v-else-if="searchError" class="search-meta">{{ searchError }}</span>
+        <span v-else class="search-meta">
+          {{ searchHits.length }} 个任务命中 · {{ searchMatched }} 条记录
+        </span>
+      </div>
+      <p v-if="!searchLoading && !searchError && !searchHits.length" class="empty">
+        没有匹配「{{ searchQuery.trim() }}」的采集结果。
+      </p>
+      <div v-else class="search-list">
+        <div v-for="hit in searchHits" :key="hit.task_id" class="search-hit">
+          <div class="search-hit-head" @click="open(hit.task_id)">
+            <span class="search-title" :title="hit.task_desc">{{ hit.task_desc }}</span>
+            <StatusBadge :status="hit.status" />
+            <span class="chip">{{ hit.matched }} / {{ hit.item_count }} 条</span>
+            <span class="mono search-time">{{ formatTime(hit.created_at) }}</span>
+            <button type="button" class="btn ghost small" @click.stop="open(hit.task_id)">
+              查看
+            </button>
+          </div>
+          <div class="search-samples">
+            <span v-for="(s, i) in hit.samples" :key="i" class="chip" :title="JSON.stringify(s.fields)">
+              {{ s.label }}
+            </span>
+            <span v-if="hit.matched > hit.samples.length" class="chip muted">
+              还有 {{ hit.matched - hit.samples.length }} 条
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <div class="card">
       <div class="table-wrap">

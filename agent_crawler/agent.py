@@ -30,6 +30,7 @@ class RunResult:
     note: str = ""
     trajectory: list = None
     timings: dict = field(default_factory=dict)
+    target: int | None = None  # 本次任务的期望条数（用于判定部分完成）
 
     def to_payload(self) -> dict:
         return {"items": self.items, "_note": self.note}
@@ -44,13 +45,26 @@ class Agent:
         self._llm_calls = 0
         self._llm_errors = 0
         self._deadline = 0.0
+        # 本次任务的显式约束（来自采集表单，优先于从描述中推断）
+        self._target: int | None = None
+        self._max_pages: int | None = None
         # 每一步完成后回调（供后端实时推送采集链路）
         self._on_step = on_step
 
     # ---------------- 主入口 ----------------
 
-    def run(self, task_desc: str, start_url: str, schema_text: str) -> RunResult:
+    def run(
+        self,
+        task_desc: str,
+        start_url: str,
+        schema_text: str,
+        site_profile: str | None = None,
+        max_items: int | None = None,
+        max_pages: int | None = None,
+    ) -> RunResult:
         fields = parse_schema(schema_text)
+        self._target = max_items if max_items and max_items > 0 else None
+        self._max_pages = max_pages if max_pages and max_pages > 0 else None
         tools = BrowserTools(
             timeout_ms=self.config.timeout_ms,
             user_agent=self.config.user_agent,
@@ -59,6 +73,7 @@ class Agent:
             block_resources=self.config.block_resources,
             reuse=self.config.browser_reuse,
             idle_timeout_s=self.config.browser_idle_timeout_s,
+            profile_dir=site_profile,
         )
         trajectory: list[dict] = []
         timings: dict[str, Any] = {}
@@ -82,6 +97,7 @@ class Agent:
                 }
             )
             result = self._loop(tools, fields, task_desc, start_url, trajectory, timings)
+            result.target = self._target or self._target_count(task_desc)
         finally:
             tools.close()
 
@@ -106,7 +122,8 @@ class Agent:
         system_prompt = build_system_prompt(task_desc, start_url, schema_fields_text)
 
         collected: list[dict] = []
-        target = self._target_count(task_desc)
+        target = self._target or self._target_count(task_desc)
+        pages_opened = 1 if start_url else 0
         no_progress = 0
         last_snapshot = ""
 
@@ -136,7 +153,7 @@ class Agent:
                 note = self._timeout_note(collected, task_desc)
                 return RunResult(items=collected, note=note, trajectory=trajectory)
 
-            user_msg = self._build_user_msg(snapshot, collected, trajectory, target)
+            user_msg = self._build_user_msg(snapshot, collected, trajectory, target, pages_opened)
             t_dec = time.perf_counter()
             action = self._decide(system_prompt, user_msg)
             if action is None:
@@ -196,6 +213,15 @@ class Agent:
                 continue
 
             # 3) 其它浏览器动作
+            if tool == "navigate":
+                # 已达到翻页上限：不再打开新页面，直接收尾
+                if self._max_pages and pages_opened >= self._max_pages:
+                    note = (
+                        f"已达到最多翻页 {self._max_pages} 页，提前结束。"
+                        + self._build_note(collected, task_desc)
+                    )
+                    return RunResult(items=collected, note=note, trajectory=trajectory)
+                pages_opened += 1
             snapshot = self._execute(tools, tool, args)
             exec_ms = _elapsed_ms(t_exec)
             timings["action_ms"] = round(timings.get("action_ms", 0) + exec_ms, 1)
@@ -270,7 +296,12 @@ class Agent:
         return None
 
     def _build_user_msg(
-        self, snapshot: str, collected: list, trajectory: list, target: int | None = None
+        self,
+        snapshot: str,
+        collected: list,
+        trajectory: list,
+        target: int | None = None,
+        pages_opened: int = 0,
     ) -> str:
         recent = trajectory[-5:]
         hist = "\n".join([f"- {t['tool']}({json.dumps(t['args'], ensure_ascii=False)})" for t in recent]) or "（无）"
@@ -281,9 +312,16 @@ class Agent:
             )
         else:
             goal = f"已收集条目数：{len(collected)}\n"
+        page_hint = ""
+        if self._max_pages:
+            page_hint = (
+                f"翻页上限：最多浏览 {self._max_pages} 页；当前已打开第 {max(1, pages_opened)} 页，"
+                "到达上限后不要再 navigate 到新的列表页。\n"
+            )
         return (
             f"当前页面快照：\n{snapshot[: self.config.max_snapshot_chars]}\n\n"
             f"{goal}"
+            f"{page_hint}"
             f"最近动作：\n{hist}\n\n"
             "请决定下一步动作。"
         )
@@ -393,7 +431,7 @@ class Agent:
 
         m = re.search(
             r"(?:前|首个|top\s*)?([0-9]+|[零一二两三四五六七八九十百千]+)\s*"
-            r"(?:本|条|个|项|台|款|件|册|篇|名|家|种|套|张|页|次|部|只|盒|瓶|箱)",
+            r"(?:本|条|个|项|台|款|件|册|篇|名|家|种|套|张|部|只|盒|瓶|箱)",
             task_desc or "",
             re.IGNORECASE,
         )
@@ -402,9 +440,8 @@ class Agent:
         raw = m.group(1)
         return int(raw) if raw.isdigit() else cls._cn_number(raw)
 
-    @classmethod
-    def _build_note(cls, collected: list, task_desc: str) -> str:
-        target = cls._target_count(task_desc)
+    def _build_note(self, collected: list, task_desc: str) -> str:
+        target = self._target or self._target_count(task_desc)
         if target is None:
             return f"本次共采集到 {len(collected)} 条数据。"
         if len(collected) >= target:

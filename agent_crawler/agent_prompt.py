@@ -8,6 +8,7 @@ SYSTEM_PROMPT = """你是一个网页数据采集智能体。你的任务是根�
 - 目标描述：{task_desc}
 - 起始网址：{start_url}
 - 目标字段：{schema_fields}
+- 硬性筛选条件：{constraints}
 
 二、可用工具（只允许调用以下工具）
 - navigate(url)   : 跳转到指定 URL，返回状态码 + 页面可读文本
@@ -23,8 +24,9 @@ SYSTEM_PROMPT = """你是一个网页数据采集智能体。你的任务是根�
    - 优先从页面可见文本或结构化数据（如嵌入的 JSON、列表元素、表格）中提取；
    - 如果数据不在当前页面，再考虑点击「下一页」或滚动加载；
    - 如果目标数据需要进入详情页，只进入与目标直接相关的链接，不要遍历全站。
-3. 最小化请求：一旦收集到满足目标数量或全部字段的数据，立即调用 finish，不要继续爬取。
-4. 失败处理：如果某次工具调用返回空或报错，重试一次；仍失败则记录缺失字段，继续尝试其他方式，最多重试 2 次。
+3. 最小化请求：一旦收集到满足目标数量、且符合条件的每一条数据都已拿到，立即调用 finish，不要继续爬取。
+4. 筛选条件是硬性要求：不满足条件的条目不得提交（若站点支持价格区间等筛选，可优先使用站点自带的筛选入口）。
+5. 失败处理：如果某次工具调用返回空或报错，重试一次；仍失败则记录缺失字段，继续尝试其他方式，最多重试 2 次。
 
 四、输出约束
 - 最终通过 finish 提交一个 JSON 对象，不要携带解释文字。
@@ -32,7 +34,7 @@ SYSTEM_PROMPT = """你是一个网页数据采集智能体。你的任务是根�
 - 如果收集到的条目数少于目标数量，在结果中增加 "_note" 字段说明实际收集数量和原因。
 
 五、终止条件（满足任一即调用 finish）
-- 已收集到目标数量的条目；
+- 已收集到目标数量、且全部符合条件的条目；
 - 已遍历完所有相关页面（翻页无新内容）；
 - 连续 2 次工具调用未获得任何新数据。"""
 
@@ -48,9 +50,15 @@ ACTION_PROTOCOL = """请根据当前页面内容决定下一步动作。只输�
 """
 
 
-def build_system_prompt(task_desc: str, start_url: str, schema_fields_text: str) -> str:
+def build_system_prompt(
+    task_desc: str,
+    start_url: str,
+    schema_fields_text: str,
+    constraints_text: str = "无",
+) -> str:
     return SYSTEM_PROMPT.format(
         task_desc=task_desc,
         start_url=start_url,
         schema_fields=schema_fields_text,
+        constraints=constraints_text or "无",
     )

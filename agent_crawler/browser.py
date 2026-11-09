@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 # 常驻浏览器池：按线程复用 Playwright/Browser，避免每次任务重复启动与冷导航。
 # Playwright 同步 API 不可跨线程使用，因此按线程 id 隔离。
@@ -26,6 +28,154 @@ def _dispose_entry(entry: dict[str, Any]) -> None:
         entry["pw"].stop()
     except Exception:
         pass
+
+
+def _meaningful(value: Any) -> bool:
+    """判断字段值是否是有效内容（用于挑选列表接口）。"""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip()) and value.strip() not in ("-", "暂无")
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    return True
+
+
+def _iter_arrays(node: Any, path: str = "", depth: int = 0):
+    """递归遍历 JSON，产出（路径, 数组）。路径用点号分隔，列表索引用数字。"""
+    if depth > 6:
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            yield from _iter_arrays(value, child, depth + 1)
+    elif isinstance(node, list):
+        dict_items = [x for x in node[:5] if isinstance(x, dict)]
+        if len(dict_items) >= 2:
+            # 看起来像列表数据：只产出本层，不再下钻元素内部
+            yield path, node
+        else:
+            for index, value in enumerate(node[:20]):
+                if isinstance(value, (dict, list)):
+                    child = f"{path}.{index}" if path else str(index)
+                    yield from _iter_arrays(value, child, depth + 1)
+
+
+def scan_candidates(
+    payload: Any,
+    source: str = "",
+    method: str = "GET",
+    limit: int = 5,
+    min_items: int = 3,
+) -> list[dict]:
+    """从一段 JSON 中找出「列表数据」候选（数组 + 稳定的标量字段）。
+
+    返回字段：url / method / items_path / count / fields / sample / score / payload。
+    评分主要看公共字段数量与列表长度：广告位、配置项这类短小数组会被淘汰。
+    """
+    found: list[dict] = []
+    for path, items in _iter_arrays(payload):
+        if not isinstance(items, list) or len(items) < min_items:
+            continue
+        sample = [x for x in items[:20] if isinstance(x, dict)]
+        if len(sample) < min_items:
+            continue
+        fields: list[str] = []
+        for key in sample[0].keys():
+            values = [x.get(key) for x in sample]
+            if not any(_meaningful(v) for v in values):
+                continue
+            # 全是嵌套对象/数组的字段对提取帮助不大，跳过
+            scalars = [v for v in values if v is not None]
+            if scalars and all(isinstance(v, (dict, list)) for v in scalars):
+                continue
+            fields.append(str(key))
+        if len(fields) < 3:
+            continue
+        score = round(len(fields) + min(len(items), 50) / 10.0, 2)
+        found.append(
+            {
+                "url": source,
+                "method": method,
+                "items_path": path,
+                "count": len(items),
+                "fields": fields[:30],
+                "sample": sample[0],
+                "score": score,
+                "payload": payload,
+            }
+        )
+    found.sort(key=lambda c: (c["score"], c["count"]), reverse=True)
+    return found[:limit]
+
+
+class NetworkRecorder:
+    """捕获页面自身的 XHR/Fetch JSON 响应，并识别其中的列表接口。
+
+    站点通常由前端调用接口渲染列表；把这个接口记下来，后续即可直接请求
+    结构化数据，不必再把整页文本交给模型逐条抄写。
+    """
+
+    def __init__(self, max_records: int = 60, max_body_bytes: int = 3_000_000):
+        self.max_records = max_records
+        self.max_body_bytes = max_body_bytes
+        self._records: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    def attach(self, page: Any) -> None:
+        """挂到页面的 response 事件上；失败不影响正常采集。"""
+        try:
+            page.on("response", self._on_response)
+        except Exception:
+            pass
+
+    def _on_response(self, response: Any) -> None:
+        try:
+            request = response.request
+            if request.resource_type not in ("xhr", "fetch"):
+                return
+            content_type = str((response.headers or {}).get("content-type") or "").lower()
+            if "json" not in content_type:
+                return
+            body = response.body()
+            if not body or len(body) > self.max_body_bytes:
+                return
+            payload = json.loads(body.decode("utf-8", "ignore"))
+        except Exception:  # noqa: BLE001 - 捕获失败不能影响页面
+            return
+        with self._lock:
+            if len(self._records) >= self.max_records:
+                return
+            self._records.append(
+                {"url": response.url, "method": request.method, "payload": payload}
+            )
+
+    def candidates(self, limit: int = 5, min_items: int = 3) -> list[dict]:
+        """汇总所有已捕获响应，按「像列表接口」的程度排序返回。"""
+        with self._lock:
+            records = list(self._records)
+        merged: list[dict] = []
+        for record in records:
+            merged.extend(
+                scan_candidates(
+                    record["payload"],
+                    source=record["url"],
+                    method=record["method"],
+                    limit=limit,
+                    min_items=min_items,
+                )
+            )
+        merged.sort(key=lambda c: (c["score"], c["count"]), reverse=True)
+        # 同一接口的多个分页响应只保留一条
+        seen: set[tuple[str, str]] = set()
+        unique: list[dict] = []
+        for item in merged:
+            key = (urlparse(item["url"]).path, item["items_path"])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique[:limit]
 
 
 class BrowserTools:
@@ -60,6 +210,8 @@ class BrowserTools:
         self._browser = None
         self._context = None
         self.page: Any = None
+        # 记录页面自身的接口响应，用于发现列表接口
+        self.recorder = NetworkRecorder()
 
     def _launch_browser(self):
         """启动浏览器：优先使用指定 channel，否则回退到系统 Edge/Chrome。"""
@@ -137,6 +289,7 @@ class BrowserTools:
                 if self._context.pages
                 else self._context.new_page()
             )
+            self.recorder.attach(self.page)
             return
 
         key = threading.get_ident()
@@ -182,6 +335,7 @@ class BrowserTools:
             )
         self._context = context
         self.page = context.new_page()
+        self.recorder.attach(self.page)
 
     def close(self) -> None:
         """关闭本次任务的页面；复用模式下保留浏览器供后续任务使用。"""
@@ -331,3 +485,41 @@ class BrowserTools:
             self.page.mouse.wheel(0, 1500)
             self.page.wait_for_timeout(500)
         return f"[scroll] 已滚动 {times} 次\n{self.snapshot()}"
+
+    # ---------------- 接口直采 ----------------
+
+    def network_candidates(self, limit: int = 5) -> list[dict]:
+        """返回页面自身请求到的列表接口候选（按相似度排序）。"""
+        try:
+            return self.recorder.candidates(limit=limit)
+        except Exception:  # noqa: BLE001 - 候选仅用于加速，失败可忽略
+            return []
+
+    def request_json(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        timeout_ms: int | None = None,
+    ) -> Any:
+        """复用当前浏览器上下文的 Cookie 直接请求接口，返回 JSON。
+
+        这样能沿用站点登录态与已获得的匿名 Cookie，同时避免再渲染页面。
+        """
+        if not self._context:
+            raise RuntimeError("浏览器尚未启动")
+        merged = {"Accept": "application/json, text/plain, */*"}
+        try:
+            page_url = self.page.url if self.page else ""
+        except Exception:  # noqa: BLE001
+            page_url = ""
+        if page_url.startswith("http"):
+            merged.setdefault("Referer", page_url)
+        merged.update(headers or {})
+
+        request = self._context.request
+        kwargs = {"headers": merged, "timeout": timeout_ms or self.timeout_ms}
+        resp = request.post(url, **kwargs) if method.upper() == "POST" else request.get(url, **kwargs)
+        if not resp.ok:
+            raise RuntimeError(f"接口返回 HTTP {resp.status}")
+        return resp.json()

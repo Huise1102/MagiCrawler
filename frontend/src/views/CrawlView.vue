@@ -23,6 +23,7 @@ const generating = ref(false)
 const error = ref('')
 const schemaHint = ref('')
 const schemaEdited = ref(false)
+const detectedFilters = ref([])
 let lastAutoDesc = ''
 let timer = null
 
@@ -142,6 +143,7 @@ async function runGenerate(auto = false) {
     form.schema_json = res.schema_json
     schemaEdited.value = false
     lastAutoDesc = desc
+    detectedFilters.value = res.filters || []
     schemaHint.value = `已识别 ${res.field_count} 个字段，可按需微调。`
   } catch (e) {
     schemaHint.value = ''
@@ -230,6 +232,7 @@ function startNewTask() {
   error.value = ''
   schemaHint.value = ''
   schemaEdited.value = false
+  detectedFilters.value = []
   lastAutoDesc = ''
   form.task_desc = ''
   form.start_url = ''
@@ -335,6 +338,13 @@ onBeforeUnmount(stopPolling)
             placeholder="填写目标描述后，大模型会自动识别字段；也可点击右上角按钮手动生成"
             @input="onSchemaInput"
           />
+          <div v-if="detectedFilters.length" class="intent-row">
+            <span class="intent-label">筛选条件</span>
+            <span v-for="item in detectedFilters" :key="item.field + item.op" class="intent-chip">
+              {{ item.label }}
+            </span>
+            <small class="intent-note">采集结果会自动按此条件过滤</small>
+          </div>
         </div>
 
         <div v-if="error" class="alert error">{{ error }}</div>

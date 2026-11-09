@@ -13,7 +13,9 @@ from typing import Any
 from .agent_prompt import ACTION_PROTOCOL, build_system_prompt
 from .browser import BrowserTools
 from .config import CrawlerConfig
+from .intent import Filter, apply_filters, describe_filters, detect_filters, filters_to_payload
 from .llm import LLMClient
+from .recipe import Recipe, execute_recipe
 from .schema import Field, parse_schema, schema_fields_to_text, validate_items
 
 
@@ -31,6 +33,10 @@ class RunResult:
     trajectory: list = None
     timings: dict = field(default_factory=dict)
     target: int | None = None  # 本次任务的期望条数（用于判定部分完成）
+    filters: list[dict] = field(default_factory=list)  # 本次生效的筛选条件
+    dropped: int = 0  # 因不满足筛选条件被丢弃的条数
+    mode: str = "agent"  # agent（页面智能体）| recipe（接口直采）
+    candidates: list = field(default_factory=list)  # 本次捕获到的列表接口候选
 
     def to_payload(self) -> dict:
         return {"items": self.items, "_note": self.note}
@@ -48,6 +54,10 @@ class Agent:
         # 本次任务的显式约束（来自采集表单，优先于从描述中推断）
         self._target: int | None = None
         self._max_pages: int | None = None
+        # 从目标描述识别出的筛选条件（由代码判定，不交给模型）
+        self._filters: list[Filter] = []
+        self._filter_display: dict[str, str] = {}
+        self._dropped = 0
         # 每一步完成后回调（供后端实时推送采集链路）
         self._on_step = on_step
 
@@ -61,6 +71,7 @@ class Agent:
         site_profile: str | None = None,
         max_items: int | None = None,
         max_pages: int | None = None,
+        recipe: dict | None = None,
     ) -> RunResult:
         fields = parse_schema(schema_text)
         self._target = max_items if max_items and max_items > 0 else None
@@ -79,8 +90,16 @@ class Agent:
         timings: dict[str, Any] = {}
         self._llm_calls = 0
         self._llm_errors = 0
+        self._dropped = 0
         self._deadline = time.monotonic() + max(1, self.config.max_run_seconds)
         start = time.perf_counter()
+
+        # 先做一次意图识别：把「50 元以内」这类描述变成可判定的约束
+        t_intent = time.perf_counter()
+        self._filters = detect_filters(self.llm, task_desc, [f.name for f in fields])
+        self._filter_display = {f.name: (f.description or f.name) for f in fields}
+        timings["intent_ms"] = _elapsed_ms(t_intent)
+
         try:
             t0 = time.perf_counter()
             tools.start()
@@ -96,8 +115,24 @@ class Agent:
                     "total_ms": timings["browser_ms"],
                 }
             )
-            result = self._loop(tools, fields, task_desc, start_url, trajectory, timings)
+            # 命中已保存的采集配方时先走接口直采；拿不到数据再回退到智能体循环
+            result = None
+            seed: list[dict] = []
+            wanted = self._target or self._target_count(task_desc)
+            if recipe:
+                result = self._run_recipe(tools, fields, recipe, start_url, trajectory, timings, wanted)
+                # 接口只拿到一部分时保留已有结果，再让智能体补采剩余数量
+                if result is not None and wanted and len(result.items) < wanted:
+                    seed = result.items
+                    result = None
+            if result is None:
+                result = self._loop(
+                    tools, fields, task_desc, start_url, trajectory, timings, seed
+                )
+            result.candidates = tools.network_candidates(limit=3)
             result.target = self._target or self._target_count(task_desc)
+            result.filters = filters_to_payload(self._filters, self._filter_display)
+            result.dropped = self._dropped
         finally:
             tools.close()
 
@@ -117,18 +152,24 @@ class Agent:
         start_url: str,
         trajectory: list,
         timings: dict,
+        seed: list[dict] | None = None,
     ) -> RunResult:
         schema_fields_text = schema_fields_to_text(fields)
-        system_prompt = build_system_prompt(task_desc, start_url, schema_fields_text)
+        constraints_text = describe_filters(self._filters, self._filter_display) or "无"
+        system_prompt = build_system_prompt(task_desc, start_url, schema_fields_text, constraints_text)
 
-        collected: list[dict] = []
+        collected: list[dict] = self._merge([], list(seed or []))
         target = self._target or self._target_count(task_desc)
         pages_opened = 1 if start_url else 0
         no_progress = 0
         last_snapshot = ""
 
         if self._remaining() <= 1:
-            return RunResult(items=[], note=self._timeout_note([], task_desc), trajectory=trajectory)
+            return RunResult(
+                items=collected,
+                note=self._timeout_note(collected, task_desc),
+                trajectory=trajectory,
+            )
 
         # 起始导航
         t0 = time.perf_counter()
@@ -178,11 +219,13 @@ class Agent:
             if tool == "finish":
                 data = args.get("data", {}) if isinstance(args, dict) else {}
                 items = validate_items(data, fields)
+                items, dropped = apply_filters(items, self._filters)
+                self._dropped += dropped
                 collected = self._merge(collected, items)
                 if target:
                     collected = collected[:target]
                 note = data.get("_note", "") if isinstance(data, dict) else ""
-                if not note:
+                if self._filters or not note:
                     note = self._build_note(collected, task_desc)
                 self._log_step(trajectory, step, tool, args, dec_ms, 0.0, len(collected))
                 return RunResult(items=collected, note=note, trajectory=trajectory)
@@ -240,6 +283,90 @@ class Agent:
         # 达到最大步数
         note = self._build_note(collected, task_desc)
         return RunResult(items=collected, note=note, trajectory=trajectory)
+
+    # ---------------- 接口直采 ----------------
+
+    def _run_recipe(
+        self,
+        tools: BrowserTools,
+        fields: list[Field],
+        recipe: dict,
+        start_url: str,
+        trajectory: list,
+        timings: dict,
+        target: int | None = None,
+    ) -> RunResult | None:
+        """按已保存的配方直接请求接口；失败返回 None 交给智能体循环。"""
+        if self._remaining() <= 1:
+            return None
+        try:
+            rec = Recipe.from_dict(recipe)
+        except Exception:  # noqa: BLE001 - 失效配方直接忽略
+            return None
+
+        # 先打开起始页：获取匿名 Cookie / 登录态，并为接口请求带上 Referer
+        t_nav = time.perf_counter()
+        try:
+            tools.navigate(start_url)
+        except Exception:  # noqa: BLE001 - 接口请求仍可继续尝试
+            pass
+        nav_ms = _elapsed_ms(t_nav)
+        timings["navigate_ms"] = nav_ms
+        self._emit(
+            {
+                "step": 0,
+                "tool": "navigate",
+                "args": {"url": start_url},
+                "time": time.strftime("%H:%M:%S"),
+                "llm_ms": 0.0,
+                "exec_ms": nav_ms,
+                "total_ms": nav_ms,
+            }
+        )
+
+        t0 = time.perf_counter()
+        try:
+            items, dropped, pages = execute_recipe(
+                tools,
+                rec,
+                fields,
+                filters=self._filters,
+                target=target,
+                max_pages=self._max_pages,
+            )
+        except Exception:  # noqa: BLE001 - 接口失效时回退到页面采集
+            return None
+        recipe_ms = _elapsed_ms(t0)
+        timings["recipe_ms"] = recipe_ms
+        if not items:
+            return None
+
+        self._dropped = dropped
+        entry = {
+            "step": 1,
+            "tool": "recipe",
+            "args": {"url": rec.url, "items_path": rec.items_path},
+            "time": time.strftime("%H:%M:%S"),
+            "llm_ms": 0.0,
+            "exec_ms": recipe_ms,
+            "total_ms": round(nav_ms + recipe_ms, 1),
+            "items": len(items),
+        }
+        trajectory.append(entry)
+        self._emit(entry)
+
+        note = f"接口直采命中已保存的配方（{rec.items_path}，共 {pages} 页），采集到 {len(items)} 条"
+        filter_text = describe_filters(self._filters, self._filter_display)
+        if filter_text:
+            note += f"；筛选条件：{filter_text}"
+            if dropped:
+                note += f"，另有 {dropped} 条不满足条件已丢弃"
+        return RunResult(
+            items=items,
+            note=note + "。",
+            trajectory=trajectory,
+            mode="recipe",
+        )
 
     # ---------------- 子步骤 ----------------
 
@@ -312,6 +439,11 @@ class Agent:
             )
         else:
             goal = f"已收集条目数：{len(collected)}\n"
+        if self._filters:
+            goal += (
+                f"筛选条件：{describe_filters(self._filters, self._filter_display)}；"
+                "只有符合条件的条目才计入已收集数量。\n"
+            )
         page_hint = ""
         if self._max_pages:
             page_hint = (
@@ -353,9 +485,13 @@ class Agent:
         # 单次提取的条数上限：Qwen 等本地模型逐 token 生成，条数过多会超出单次调用超时
         cap = min(remain, 20) if remain else 20
         limit = f"最多 {cap} 条。"
+        constraint = ""
+        if self._filters:
+            constraint = f"硬性筛选条件：{describe_filters(self._filters, self._filter_display)}；不满足条件的条目一律不要输出。\n"
         prompt = (
             f"从页面中提取满足条件的条目，{limit}"
-            '只输出紧凑 JSON（单行、无缩进、无多余空白），格式 {"items":[{...}]}。'
+            + constraint
+            + '只输出紧凑 JSON（单行、无缩进、无多余空白），格式 {"items":[{...}]}。'
             f"每个对象只包含这些字段：{names}。缺失字段设为 null，不要编造，不要任何说明文字。\n"
             "页面中的时长（如 03:06）、播放量/点赞数（如 1.7万）等按原文照抄，"
             "不要自行换算或因为格式特殊而丢弃；只有页面上确实找不到对应信息时才填 null。\n"
@@ -375,7 +511,10 @@ class Agent:
         self._llm_calls += 1
         data = self.llm.extract_json(raw)
         if isinstance(data, dict) and isinstance(data.get("items"), list):
-            return validate_items(data["items"], fields)
+            candidates = validate_items(data["items"], fields)
+            kept, dropped = apply_filters(candidates, self._filters)
+            self._dropped += dropped
+            return kept
         return []
 
     # ---------------- 时间预算 ----------------
@@ -443,7 +582,13 @@ class Agent:
     def _build_note(self, collected: list, task_desc: str) -> str:
         target = self._target or self._target_count(task_desc)
         if target is None:
-            return f"本次共采集到 {len(collected)} 条数据。"
-        if len(collected) >= target:
-            return f"已采集到目标数量（{target} 条），实际 {len(collected)} 条。"
-        return f"目标数量 {target} 条，实际采集到 {len(collected)} 条（可能因翻页结束或无更多数据）。"
+            note = f"本次共采集到 {len(collected)} 条数据"
+        elif len(collected) >= target:
+            note = f"已采集到目标数量（{target} 条），实际 {len(collected)} 条"
+        else:
+            note = f"目标数量 {target} 条，实际采集到 {len(collected)} 条（可能因翻页结束或无更多符合条件的条目）"
+        filter_text = describe_filters(self._filters, self._filter_display)
+        if filter_text:
+            dropped_text = f"，另有 {self._dropped} 条不满足条件已丢弃" if self._dropped else ""
+            return f"{note}；筛选条件：{filter_text}{dropped_text}。"
+        return f"{note}。"

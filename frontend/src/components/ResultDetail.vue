@@ -177,6 +177,7 @@ watch(() => props.task.id, loadDiff)
       <span v-if="timings.navigate_ms" class="chip">首次导航 {{ formatMs(timings.navigate_ms) }}</span>
       <span v-if="timings.decision_ms" class="chip">LLM 决策 {{ formatMs(timings.decision_ms) }}</span>
       <span v-if="timings.extract_ms" class="chip">数据提取 {{ formatMs(timings.extract_ms) }}</span>
+      <span v-if="timings.recipe_ms" class="chip">接口直采 {{ formatMs(timings.recipe_ms) }}</span>
       <span v-if="timings.action_ms" class="chip">页面动作 {{ formatMs(timings.action_ms) }}</span>
       <span v-if="timings.llm_calls" class="chip">LLM 调用 {{ timings.llm_calls }} 次</span>
       <span v-if="timings.steps" class="chip">{{ timings.steps }} 步</span>

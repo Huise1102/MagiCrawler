@@ -90,6 +90,20 @@ CREATE TABLE IF NOT EXISTS sites (
 );
 """
 
+_RECIPES_SQL = """
+CREATE TABLE IF NOT EXISTS recipes (
+    id           TEXT PRIMARY KEY,
+    domain       TEXT NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    recipe_json  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    last_used_at TEXT NOT NULL DEFAULT '',
+    use_count    INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_domain ON recipes(domain);
+"""
+
 # 旧库升级：字段名 -> 列定义
 _TASKS_COLUMNS = {
     "schedule_id": "TEXT NOT NULL DEFAULT ''",
@@ -139,6 +153,7 @@ class Storage:
         self._conn.execute(_TASKS_SQL)
         self._conn.execute(_SCHEDULES_SQL)
         self._conn.executescript(_DOCS_SQL)
+        self._conn.executescript(_RECIPES_SQL)
         self._ensure_columns("tasks", _TASKS_COLUMNS)
         self._ensure_columns("schedules", _SCHEDULES_COLUMNS)
         self._ensure_columns("documents", _DOC_COLUMNS)
@@ -385,6 +400,87 @@ class Storage:
     def delete_site(self, site_id: str) -> None:
         self._conn.execute("DELETE FROM sites WHERE id = ?", (site_id,))
         self._conn.commit()
+
+    # ---------------- 采集配方 ----------------
+
+    @staticmethod
+    def _recipe_row(row: dict) -> dict[str, Any]:
+        """把数据库行还原为接口结构（recipe 为真实字典）。"""
+        try:
+            recipe = json.loads(row.get("recipe_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            recipe = {}
+        return {
+            "id": row["id"],
+            "domain": row["domain"],
+            "name": row.get("name") or "",
+            "recipe": recipe if isinstance(recipe, dict) else {},
+            "created_at": row.get("created_at") or "",
+            "updated_at": row.get("updated_at") or "",
+            "last_used_at": row.get("last_used_at") or "",
+            "use_count": int(row.get("use_count") or 0),
+        }
+
+    def save_recipe(self, domain: str, recipe: dict, name: str = "") -> str:
+        """按域名保存配方（同一域名只保留一份），返回配方 id。"""
+        from .models import _new_id, _now
+
+        domain = (domain or "").strip().lower()
+        if not domain:
+            raise ValueError("配方缺少域名")
+        now = _now()
+        row = self._conn.execute(
+            "SELECT id FROM recipes WHERE domain = ?", (domain,)
+        ).fetchone()
+        payload = json.dumps(recipe, ensure_ascii=False)
+        if row:
+            recipe_id = row["id"]
+            self._conn.execute(
+                "UPDATE recipes SET recipe_json = ?, name = ?, updated_at = ? WHERE id = ?",
+                (payload, name, now, recipe_id),
+            )
+        else:
+            recipe_id = _new_id()
+            self._conn.execute(
+                """
+                INSERT INTO recipes (id, domain, name, recipe_json, created_at,
+                                     updated_at, last_used_at, use_count)
+                VALUES (?, ?, ?, ?, ?, ?, '', 0)
+                """,
+                (recipe_id, domain, name, payload, now, now),
+            )
+        self._conn.commit()
+        return recipe_id
+
+    def get_recipe_by_domain(self, domain: str) -> Optional[dict[str, Any]]:
+        domain = (domain or "").strip().lower()
+        if not domain:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM recipes WHERE domain = ?", (domain,)
+        ).fetchone()
+        return self._recipe_row(dict(row)) if row else None
+
+    def list_recipes(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM recipes ORDER BY updated_at DESC"
+        ).fetchall()
+        return [self._recipe_row(dict(r)) for r in rows]
+
+    def touch_recipe(self, recipe_id: str) -> None:
+        """记录配方命中：更新最近使用时间与使用次数。"""
+        from .models import _now
+
+        self._conn.execute(
+            "UPDATE recipes SET last_used_at = ?, use_count = use_count + 1 WHERE id = ?",
+            (_now(), recipe_id),
+        )
+        self._conn.commit()
+
+    def delete_recipe(self, recipe_id: str) -> bool:
+        cur = self._conn.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
 
     # ---------------- 分类 ----------------
 

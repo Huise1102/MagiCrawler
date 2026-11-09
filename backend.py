@@ -43,8 +43,11 @@ from agent_crawler import (
     TASK_STATUS,
     Visualizer,
     load_config,
+    parse_schema,
 )
 from agent_crawler.exporter import export_result
+from agent_crawler.intent import detect_filters, filters_to_payload
+from agent_crawler.recipe import build_recipe
 from agent_crawler.storage import Storage, normalize_fields
 
 logger = logging.getLogger("uvicorn.error")
@@ -822,10 +825,21 @@ def _generate_schema(task_desc: str, start_url: str) -> dict:
     schema = _clean_generated_schema(llm_client.extract_json(raw))
     if not schema:
         raise ValueError("大模型未返回有效字段，请调整目标描述后重试")
+    # 顺带识别硬性筛选条件，供界面预览；失败不影响字段生成
+    try:
+        filters = detect_filters(llm_client, task_desc, list(schema["properties"]))
+    except Exception:  # noqa: BLE001 - 仅用于展示，不能阻断
+        filters = []
+    display = {
+        name: str(spec.get("description") or name)
+        for name, spec in schema["properties"].items()
+        if isinstance(spec, dict)
+    }
     return {
         "schema": schema,
         "schema_json": json.dumps(schema, ensure_ascii=False, indent=2),
         "field_count": len(schema["properties"]),
+        "filters": filters_to_payload(filters, display),
     }
 
 
@@ -867,6 +881,12 @@ async def _run_task(task_id: str) -> None:
         if len(chain) < _CHAIN_MAX_STEPS:
             chain.append(entry)
 
+    # 同一域名曾跑通过时，优先按已保存的配方直采接口
+    domain = _normalize_domain(task.start_url)
+    recipe_row = storage.get_recipe_by_domain(domain) if domain else None
+    recipe_payload = recipe_row["recipe"] if recipe_row else None
+
+    result = None
     try:
         agent = Agent(llm_client, _app_crawler_config, on_step=_on_step)
         result = await asyncio.to_thread(
@@ -877,7 +897,12 @@ async def _run_task(task_id: str) -> None:
             site_profile or None,
             task.max_items or None,
             task.max_pages or None,
+            recipe_payload,
         )
+
+        if recipe_row and result.mode == "recipe":
+            storage.touch_recipe(recipe_row["id"])
+            logger.info("任务 %s 命中采集配方：%s", task_id[:8], domain)
 
         task.result_json = json.dumps(result.items, ensure_ascii=False)
         task.note = result.note
@@ -924,6 +949,38 @@ async def _run_task(task_id: str) -> None:
         logger.exception("任务失败 %s：%s", task_id[:8], e)
     storage.save(task)
     await asyncio.to_thread(_notify_task, task)
+
+    # 任务已落库/通知后再沉淀配方，避免额外耗时拖慢任务完成
+    if result is not None and result.mode != "recipe" and result.items and result.candidates:
+        try:
+            learned = await asyncio.to_thread(
+                _learn_recipe, domain, task.schema_json, result.candidates
+            )
+            if learned:
+                logger.info("任务 %s 已生成采集配方：%s", task_id[:8], domain)
+        except Exception:  # noqa: BLE001 - 学习失败不影响任务结果
+            logger.warning("生成采集配方失败（不影响本次结果）", exc_info=True)
+
+
+def _learn_recipe(domain: str, schema_json: str, candidates: list[dict]) -> bool:
+    """从捕获到的接口候选里生成并保存一份采集配方。"""
+    if not domain or not candidates:
+        return False
+    try:
+        fields = parse_schema(schema_json)
+    except Exception:  # noqa: BLE001
+        return False
+
+    for candidate in candidates[:3]:
+        try:
+            recipe = build_recipe(llm_client, domain, candidate, fields)
+        except Exception:  # noqa: BLE001 - 换下一个候选
+            recipe = None
+        if recipe is None:
+            continue
+        storage.save_recipe(domain, recipe.to_dict(), name=recipe.name)
+        return True
+    return False
 
 
 def _status_from(result) -> str:
@@ -1675,6 +1732,38 @@ def delete_site(site_id: str):
     # 同时清理本地登录态，避免残留 Cookies
     shutil.rmtree(_site_profile_dir(site_id), ignore_errors=True)
     logger.info("删除网站记忆 %s：%s", site_id[:8], site.name)
+    return {"ok": True}
+
+
+# ---------------- 采集配方 ----------------
+
+
+@app.get("/api/recipes")
+def list_recipes():
+    """已学习的接口配方列表（同一域名一份）。"""
+    items = []
+    for row in storage.list_recipes():
+        recipe = row.get("recipe") or {}
+        items.append(
+            {
+                "id": row["id"],
+                "domain": row["domain"],
+                "name": row["name"],
+                "url": recipe.get("url", ""),
+                "items_path": recipe.get("items_path", ""),
+                "max_pages": recipe.get("max_pages", 1),
+                "use_count": row["use_count"],
+                "last_used_at": row["last_used_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+    return {"items": items}
+
+
+@app.delete("/api/recipes/{recipe_id}")
+def delete_recipe(recipe_id: str):
+    if not storage.delete_recipe(recipe_id):
+        raise HTTPException(status_code=404, detail="配方不存在")
     return {"ok": True}
 
 

@@ -47,7 +47,6 @@ from agent_crawler import (
 )
 from agent_crawler.exporter import export_result
 from agent_crawler.intent import detect_filters, filters_to_payload
-from agent_crawler.recipe import build_recipe
 from agent_crawler.storage import Storage, normalize_fields
 
 logger = logging.getLogger("uvicorn.error")
@@ -898,6 +897,7 @@ async def _run_task(task_id: str) -> None:
             task.max_items or None,
             task.max_pages or None,
             recipe_payload,
+            learn_dom=not bool(recipe_row),
         )
 
         if recipe_row and result.mode == "recipe":
@@ -951,36 +951,13 @@ async def _run_task(task_id: str) -> None:
     await asyncio.to_thread(_notify_task, task)
 
     # 任务已落库/通知后再沉淀配方，避免额外耗时拖慢任务完成
-    if result is not None and result.mode != "recipe" and result.items and result.candidates:
+    learned = result.learned_recipe if result is not None else None
+    if learned:
         try:
-            learned = await asyncio.to_thread(
-                _learn_recipe, domain, task.schema_json, result.candidates
-            )
-            if learned:
-                logger.info("任务 %s 已生成采集配方：%s", task_id[:8], domain)
+            storage.save_recipe(domain, learned, name=str(learned.get("name") or ""))
+            logger.info("任务 %s 已生成采集配方：%s", task_id[:8], domain)
         except Exception:  # noqa: BLE001 - 学习失败不影响任务结果
-            logger.warning("生成采集配方失败（不影响本次结果）", exc_info=True)
-
-
-def _learn_recipe(domain: str, schema_json: str, candidates: list[dict]) -> bool:
-    """从捕获到的接口候选里生成并保存一份采集配方。"""
-    if not domain or not candidates:
-        return False
-    try:
-        fields = parse_schema(schema_json)
-    except Exception:  # noqa: BLE001
-        return False
-
-    for candidate in candidates[:3]:
-        try:
-            recipe = build_recipe(llm_client, domain, candidate, fields)
-        except Exception:  # noqa: BLE001 - 换下一个候选
-            recipe = None
-        if recipe is None:
-            continue
-        storage.save_recipe(domain, recipe.to_dict(), name=recipe.name)
-        return True
-    return False
+            logger.warning("保存采集配方失败（不影响本次结果）", exc_info=True)
 
 
 def _status_from(result) -> str:
@@ -1740,7 +1717,7 @@ def delete_site(site_id: str):
 
 @app.get("/api/recipes")
 def list_recipes():
-    """已学习的接口配方列表（同一域名一份）。"""
+    """已学习的配方列表（同一域名一份，接口配方或 DOM 配方）。"""
     items = []
     for row in storage.list_recipes():
         recipe = row.get("recipe") or {}
@@ -1749,8 +1726,9 @@ def list_recipes():
                 "id": row["id"],
                 "domain": row["domain"],
                 "name": row["name"],
-                "url": recipe.get("url", ""),
-                "items_path": recipe.get("items_path", ""),
+                "kind": recipe.get("kind") or "api",
+                "url": recipe.get("url") or recipe.get("list_url", ""),
+                "items_path": recipe.get("items_path") or recipe.get("item_selector", ""),
                 "max_pages": recipe.get("max_pages", 1),
                 "use_count": row["use_count"],
                 "last_used_at": row["last_used_at"],

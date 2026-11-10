@@ -16,7 +16,7 @@ const TOOL_LABEL = {
   click: '点击元素',
   scroll: '滚动页面',
   extract: '提取数据',
-  recipe: '接口直采',
+  recipe: '配方直采',
   finish: '完成采集',
 }
 // 无任务时展示的阶段占位，让链路形态始终可见
@@ -65,7 +65,7 @@ function nodeDetail(step) {
     case 'extract':
       return step.items != null ? `累计 ${step.items} 条` : '解析页面结构化数据'
     case 'recipe':
-      return `${args.items_path || '列表接口'}${step.items != null ? ` · ${step.items} 条` : ''}`
+      return `${args.items_path || args.item_selector || '已保存配方'}${step.items != null ? ` · ${step.items} 条` : ''}`
     case 'finish':
       return step.items != null ? `最终 ${step.items} 条` : '收尾并校验结果'
     default:

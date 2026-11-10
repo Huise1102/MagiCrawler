@@ -142,6 +142,8 @@ def _to_number(value: Any) -> float:
     s = str(value).strip().replace(",", "").replace("，", "").replace("+", "").replace("＋", "")
     # 去掉货币符号与「元」，如 £51.77 / ¥129 / 199元
     s = re.sub(r"[¥￥$€£]|元", "", s).strip()
+    # 部分站点把小数拆成多行（京东「75. 60」），去掉内部空白得到 75.60
+    s = re.sub(r"\s+", "", s)
     if not s:
         raise ValueError("empty")
     if _TIME_RE.fullmatch(s):
@@ -182,6 +184,11 @@ def _coerce(value: Any, ftype: str) -> Any:
         return value
     except (ValueError, TypeError):
         return None
+
+
+def coerce_value(value: Any, ftype: str = "string") -> Any:
+    """按字段类型转换单个值（供详情页补齐等外部模块复用）。"""
+    return _coerce(value, ftype)
 
 
 def validate_items(raw_items: Any, fields: list[Field]) -> list[dict]:

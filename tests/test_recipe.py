@@ -1,4 +1,4 @@
-"""接口配方单测：候选识别、配方生成校验、确定性执行与存储。"""
+"""采集配方单测：候选识别、配方生成校验、确定性执行与存储（接口 + DOM）。"""
 
 from __future__ import annotations
 
@@ -9,12 +9,17 @@ import pytest
 from agent_crawler.browser import NetworkRecorder, scan_candidates
 from agent_crawler.intent import Filter
 from agent_crawler.recipe import (
+    DomRecipe,
     Recipe,
     RecipeError,
+    build_dom_recipe,
     build_recipe,
+    execute_dom_recipe,
     execute_recipe,
+    is_dom_recipe,
     json_at,
     page_url,
+    parse_dom_recipe,
     parse_recipe,
 )
 from agent_crawler.schema import parse_schema
@@ -285,3 +290,241 @@ class TestRecipeStorage:
             assert store.get_recipe_by_domain("example.com") is None
         finally:
             store.close()
+
+
+# ---------------- DOM 配方 ----------------
+
+def _dom_rows(start: int = 1, count: int = 4) -> list[dict]:
+    """构造一页卡片数据（含详情链接）。"""
+    return [
+        {
+            "title": f"书{start + i}",
+            "price": str(50 + i),
+            "_url": f"https://example.com/item/{start + i}",
+        }
+        for i in range(count)
+    ]
+
+
+class FakeDomTools:
+    """按页返回卡片数据的假浏览器工具；点击翻页后切到下一页。"""
+
+    def __init__(self, pages, next_ok=True, details=None):
+        self.pages = list(pages)
+        self.next_ok = next_ok
+        self.details = details or {}
+        self.index = 0
+        self.nav_urls: list[str] = []
+        self.clicks: list[str] = []
+        self.detail_calls: list[str] = []
+
+    def navigate(self, url):
+        self.nav_urls.append(url)
+        self.index = 0
+        return ""
+
+    def extract_dom(self, item_selector, field_selectors, link_selector="", limit=0):
+        rows = self.pages[self.index] if self.index < len(self.pages) else []
+        return [dict(row) for row in rows]
+
+    def click_selector(self, selector):
+        self.clicks.append(selector)
+        if not self.next_ok or self.index + 1 >= len(self.pages):
+            return False
+        self.index += 1
+        return True
+
+    def click_next_page(self):
+        return ""
+
+    def extract_detail(self, url, field_selectors, mobile=False):
+        self.detail_calls.append(url)
+        return dict(self.details.get(url, {}))
+
+
+class SeqLLM:
+    """按顺序吐出多段 JSON 的假模型。"""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def chat(self, messages, temperature=0, timeout=None):
+        self.calls += 1
+        return json.dumps(self.responses.pop(0), ensure_ascii=False)
+
+    @staticmethod
+    def extract_json(text):
+        return json.loads(text)
+
+
+class HintTools:
+    """提供页面结构线索的假工具，用于生成 DOM 配方。"""
+
+    def __init__(
+        self,
+        rows,
+        next_selector="a.pn-next",
+        detail=None,
+        html="<li class='card'></li>",
+        js_values=None,
+    ):
+        self.rows = rows
+        self.next_selector = next_selector
+        self.detail = detail or {}
+        self.html = html
+        self.js_values = js_values or []
+
+    def list_hints(self, limit=2):
+        return {
+            "items": [
+                {"selector": "li.card", "count": len(self.rows), "sample_html": self.html}
+            ],
+            "next_selector": self.next_selector,
+        }
+
+    def extract_dom(self, item_selector, field_selectors, link_selector="", limit=0):
+        return [dict(row) for row in self.rows]
+
+    def fetch_detail_sample(self, url, max_chars=8000, mobile=False, js_keys=None):
+        return {"html": self.html, "js_values": self.js_values}
+
+    def extract_detail(self, url, field_selectors, mobile=False):
+        return dict(self.detail)
+
+
+class TestDomRecipe:
+    def _recipe(self, **kwargs) -> DomRecipe:
+        base = {
+            "domain": "example.com",
+            "list_url": "https://example.com/list",
+            "item_selector": "li.card",
+            "field_selectors": {"title": ".name", "price": ".price"},
+            "next_selector": "a.pn-next",
+            "max_pages": 3,
+        }
+        base.update(kwargs)
+        return DomRecipe(**base)
+
+    def test_kind_detection(self):
+        assert is_dom_recipe(self._recipe().to_dict())
+        assert not is_dom_recipe({"url": "https://a.com/api", "items_path": "data.list"})
+
+    def test_from_dict_and_roundtrip(self):
+        restored = DomRecipe.from_dict(json.loads(json.dumps(self._recipe().to_dict())))
+        assert restored.item_selector == "li.card"
+        assert restored.field_selectors == {"title": ".name", "price": ".price"}
+
+        with pytest.raises(RecipeError):
+            DomRecipe.from_dict({"domain": "example.com"})
+
+    def test_parse_rejects_unknown_fields(self):
+        data = {
+            "item_selector": "li.card",
+            "fields": {"title": ".name", "nope": ".x"},
+            "link_selector": "a@href",
+        }
+        recipe = parse_dom_recipe(data, "example.com", "https://example.com/list", ["title"])
+        assert recipe is not None
+        assert recipe.field_selectors == {"title": ".name"}
+        assert recipe.link_selector == "a@href"
+
+    def test_execute_paginate_and_target(self):
+        tools = FakeDomTools([_dom_rows(1, 4), _dom_rows(5, 4)])
+        fields = parse_schema('{"title":"string","price":"number"}')
+        items, dropped, pages = execute_dom_recipe(tools, self._recipe(), fields, target=5)
+        assert len(items) == 5
+        assert dropped == 0
+        assert pages == 2
+        assert tools.nav_urls == ["https://example.com/list"]
+        assert items[0] == {"title": "书1", "price": 50.0, "_url": "https://example.com/item/1"}
+
+    def test_execute_filter(self):
+        tools = FakeDomTools([_dom_rows(1, 4)])
+        fields = parse_schema('{"title":"string","price":"number"}')
+        filters = [Filter(field="price", op="gte", value=52.0, unit="元")]
+        items, dropped, pages = execute_dom_recipe(tools, self._recipe(max_pages=1), fields, filters=filters)
+        assert len(items) == 2
+        assert dropped == 2
+        assert pages == 1
+
+    def test_stops_when_next_page_missing(self):
+        tools = FakeDomTools([_dom_rows(1, 4), _dom_rows(5, 4)], next_ok=False)
+        fields = parse_schema('{"title":"string","price":"number"}')
+        items, _, pages = execute_dom_recipe(tools, self._recipe(), fields)
+        assert len(items) == 4
+        assert pages == 1
+        assert tools.clicks == ["a.pn-next"]
+
+    def test_detail_fill_respects_limit(self):
+        tools = FakeDomTools(
+            [_dom_rows(1, 4)],
+            details={"https://example.com/item/1": {"author": "张三"}},
+        )
+        fields = parse_schema('{"title":"string","price":"number","author":"string"}')
+        recipe = self._recipe(
+            detail_selectors={"author": ".author"},
+            detail_limit=2,
+            max_pages=1,
+        )
+        items, _, _ = execute_dom_recipe(tools, recipe, fields)
+        assert items[0]["author"] == "张三"
+        assert len(tools.detail_calls) == 2
+        assert items[1]["author"] is None
+
+    def test_raises_when_cards_missing(self):
+        tools = FakeDomTools([[]])
+        fields = parse_schema('{"title":"string"}')
+        with pytest.raises(RecipeError):
+            execute_dom_recipe(tools, self._recipe(), fields)
+
+    def test_build_recipe_with_llm(self):
+        llm = SeqLLM(
+            {
+                "item_selector": "li.card",
+                "fields": {"title": ".name", "price": ".price"},
+                "link_selector": "a@href",
+            },
+            {"fields": {"author": ".author"}},
+        )
+        rows = [
+            {
+                "title": "书1",
+                "price": "50",
+                "_url": "https://example.com/item/1",
+            }
+        ] * 3
+        tools = HintTools(rows, detail={"author": "张三"})
+        fields = parse_schema('{"title":"string","price":"number","author":"string"}')
+        recipe = build_dom_recipe(llm, tools, "example.com", "https://example.com/list", fields)
+        assert recipe is not None
+        assert recipe.item_selector == "li.card"
+        assert recipe.field_selectors == {"title": ".name", "price": ".price"}
+        assert recipe.next_selector == "a.pn-next"
+        assert recipe.detail_selectors == {"author": ".author"}
+        assert llm.calls == 2
+
+    def test_build_recipe_uses_js_values_for_isbn(self):
+        llm = SeqLLM(
+            {"item_selector": "li.card", "fields": {"title": ".name"}},
+            {"fields": {"isbn": "js:_itemOnly.item.upc"}},
+        )
+        rows = [{"title": "书1", "_url": "https://example.com/item/1"}] * 3
+        tools = HintTools(
+            rows,
+            detail={"isbn": "9787517139232"},
+            js_values=[{"path": "_itemOnly.item.upc", "value": "9787517139232"}],
+        )
+        fields = parse_schema('{"title":"string","isbn":"string"}')
+        recipe = build_dom_recipe(llm, tools, "example.com", "https://example.com/list", fields)
+        assert recipe is not None
+        assert recipe.detail_selectors == {"isbn": "js:_itemOnly.item.upc"}
+
+    def test_build_recipe_rejects_bad_selectors(self):
+        llm = SeqLLM(
+            {"item_selector": "li.card", "fields": {"title": ".missing"}},
+            {"item_selector": "li.card", "fields": {"title": ".missing"}},
+        )
+        tools = HintTools([{"price": "50"}, {"price": "60"}, {"price": "70"}])
+        fields = parse_schema('{"title":"string"}')
+        assert build_dom_recipe(llm, tools, "example.com", "https://example.com/list", fields) is None
